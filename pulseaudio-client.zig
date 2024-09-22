@@ -21,6 +21,7 @@ pub fn main() !void {
     const app_id = try std.fmt.bufPrint(&buf_id, "{}", .{std.os.linux.getpid()});
 
     var list = PulseAudio.PropertyList.init(.{
+        .MediaRole = "game",
         .ApplicationName = app_name,
         .ApplicationProcessId = app_id,
         .ApplicationProcessBinary = app_path,
@@ -30,6 +31,27 @@ pub fn main() !void {
         std.log.info("Error Code: {?}", .{pa.error_code});
         return e;
     };
+
+    std.log.info("Client Index: {}", .{pa.client_index});
+
+    while (true) {}
+}
+
+fn state_callback(pa: *PulseAudio, userdata: *anyopaque) void {
+    _ = userdata;
+    const state = pa.get_context_state();
+    switch (state) {
+        .Unconnected,
+        .Connecting,
+        .Authorizing,
+        .SettingName,
+        => {},
+        .Failed,
+        .Terminated,
+        => {},
+        .Ready,
+        => {},
+    }
 }
 
 const PulseAudio = struct {
@@ -41,6 +63,18 @@ const PulseAudio = struct {
     fbs_write: std.io.FixedBufferStream([]u8) = undefined,
     fbs_read: std.io.FixedBufferStream([]u8) = undefined,
     socket: ?std.net.Stream = null,
+
+    const Context = struct {
+        const State = enum {
+            Unconnected,
+            Connecting,
+            Authorizing,
+            SettingName,
+            Failed,
+            Terminated,
+            Ready,
+        };
+    };
 
     pub fn connect(pa: *PulseAudio) !void {
         var buf_fba: [4096]u8 = undefined;
@@ -63,7 +97,7 @@ const PulseAudio = struct {
 
         const writer = pa.fbs_write.writer();
 
-        try pa.write_pa_header(writer.any(), Command.Auth);
+        try pa.write_pa_header(writer.any(), Command.Tag.Auth);
         try write_pa_u32(writer.any(), version);
         try write_pa_arbitrary(writer.any(), cookie);
 
@@ -76,10 +110,8 @@ const PulseAudio = struct {
         pa.fbs_read = std.io.fixedBufferStream(pa.buf_read[0..count]);
         const reader = pa.fbs_read.reader();
 
-        const header = try read_pa_header(reader.any());
-        _ = header;
-        const command = try read_pa_command(reader.any());
-        if (command != .Reply) return error.UnexpectedCommand;
+        const packet = try read_packet(reader.any());
+        if (packet.command != .Reply) return error.UnexpectedCommand;
         std.debug.assert(try reader.readEnum(Type, .big) == .Uint32);
         const version_srv = try reader.readInt(u32, .big);
         if (version_srv & version_mask < version) {
@@ -100,7 +132,7 @@ const PulseAudio = struct {
 
         const writer = pa.fbs_write.writer().any();
 
-        try pa.write_pa_header(writer, Command.SetClientName);
+        try pa.write_pa_header(writer, Command.Tag.SetClientName);
 
         try writer.writeByte(@intFromEnum(Type.PropList));
 
@@ -122,12 +154,11 @@ const PulseAudio = struct {
         pa.fbs_read = std.io.fixedBufferStream(pa.buf_read[0..count]);
         const reader = pa.fbs_read.reader();
 
-        const header = try read_pa_header(reader.any());
-        std.debug.assert(header.channel == std.math.maxInt(u32));
-        const command = try read_pa_command(reader.any());
-        if (command != .Reply) {
-            std.debug.assert(try reader.readEnum(Type, .big) == .Uint32);
-            pa.error_code = try reader.readEnum(Error, .big);
+        const packet = try read_packet(reader.any());
+        std.debug.assert(packet.header.channel == std.math.maxInt(u32));
+        if (packet.command != .Reply) {
+            std.debug.assert(packet.command == .Error);
+            pa.error_code = packet.command.Error;
             return error.UnexpectedCommand;
         }
         std.debug.assert(try reader.readEnum(Type, .big) == .Uint32);
@@ -183,6 +214,28 @@ const PulseAudio = struct {
         flags: u32,
     };
 
+    const Packet = struct {
+        header: Header,
+        seq: u32,
+        command: Command,
+    };
+
+    pub fn read_packet(reader: std.io.AnyReader) !Packet {
+        const header = try read_pa_header(reader);
+        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
+        const command_tag = try reader.readEnum(Command.Tag, .big);
+        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
+        const seq = try reader.readInt(u32, .big);
+
+        const command = try Command.read(reader, command_tag);
+
+        return .{
+            .header = header,
+            .seq = seq,
+            .command = command,
+        };
+    }
+
     pub fn read_pa_header(reader: std.io.AnyReader) !Header {
         const length = try reader.readInt(u32, .big);
         const channel = try reader.readInt(u32, .big);
@@ -199,17 +252,7 @@ const PulseAudio = struct {
         };
     }
 
-    pub fn read_pa_command(reader: std.io.AnyReader) !Command {
-        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
-        const command = try reader.readEnum(Command, .big);
-        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
-        const seq = try reader.readEnum(Command, .big);
-        _ = seq; // TODO
-
-        return command;
-    }
-
-    pub fn write_pa_header(pa: *PulseAudio, writer: std.io.AnyWriter, command: Command) !void {
+    pub fn write_pa_header(pa: *PulseAudio, writer: std.io.AnyWriter, command: Command.Tag) !void {
         try writer.writeInt(u32, 0x0, .big); // length - this will be fixed up later
         try writer.writeInt(u32, 0xff_ff_ff_ff, .big); // channel
         try writer.writeInt(u32, 0x0, .big); // offset high
@@ -232,6 +275,12 @@ const PulseAudio = struct {
     pub fn write_pa_u32(writer: std.io.AnyWriter, int: u32) !void {
         try writer.writeByte(@intFromEnum(PulseAudio.Type.Uint32)); // type tag
         try writer.writeInt(u32, int, .big); // seq
+    }
+
+    pub fn read_pa_u32(reader: std.io.AnyReader) !u32 {
+        if (try reader.readEnum(PulseAudio.Type, .big) != .Uint32) return error.UintTagNotFound;
+        const int = try reader.readInt(u32, .big); // seq
+        return int;
     }
 
     pub fn write_pa_arbitrary(writer: std.io.AnyWriter, blob: []const u8) !void {
@@ -257,6 +306,69 @@ const PulseAudio = struct {
         /// If the client supports shared memory blocks
         supports_shm: bool,
     };
+
+    const SampleSpec = struct {
+        format: Format,
+        channels: u8,
+        sample_rate: u32,
+
+        const Format = enum(u8) {
+            Invalid = std.math.maxInt(u8),
+            Uint8 = 0,
+            Alaw = 1,
+            Ulaw = 2,
+            Sint16Le = 3,
+            Sint16Be = 4,
+            Float32Le = 5,
+            Float32Be = 6,
+            Sint32Le = 7,
+            Sint32Be = 8,
+            Sint24Le = 9,
+            Sint24Be = 10,
+            Sint24in32Le = 11,
+            Sint24in32Be = 12,
+        };
+    };
+    const MAX_CHANNELS = 32;
+    const ChannelMap = struct {
+        channels: u8,
+        map: [MAX_CHANNELS]Position,
+        const Position = enum {};
+    };
+    const Volume = enum(u32) { _ };
+    const ChannelVolume = struct {
+        channels: u8,
+        volumes: [MAX_CHANNELS]Volume,
+    };
+    const FormatEncoding = enum {};
+    const FormatInfo = struct {
+        encoding: FormatEncoding,
+        props: PropertyList,
+    };
+    const StreamFlags = packed struct(u16) {
+        _unused: u32,
+    };
+    const BufferAttr = struct {
+        max_length: u32,
+        target_length: u32,
+        pre_buffering: u32,
+        minimum_request_length: u32,
+        fragment_size: u32,
+    };
+
+    const PlaybackStreamParams = struct {
+        sample_spec: SampleSpec,
+        channel_map: ChannelMap,
+        sink_index: ?u32,
+        sink_name: ?[]const u8 = null,
+        buffer_attr: BufferAttr,
+        sync_id: u32,
+        cvolume: ?ChannelVolume,
+        props: PropertyList,
+        formats: []const FormatInfo,
+        flags: StreamFlags,
+    };
+
     const Error = enum(u32) {
         AccessDenied = 1,
         Command = 2,
@@ -307,19 +419,63 @@ const PulseAudio = struct {
         FormatInfo = 'f',
         _,
     };
-    const Command = enum(u32) {
-        Error = 0,
-        Timeout = 1,
-        Reply = 2,
 
-        CreatePlaybackStream = 3,
-        DeletePlaybackStream = 4,
-        CreateRecordStream = 5,
-        DeleteRecordStream = 6,
-        Exit = 7,
-        Auth = 8,
-        SetClientName = 9,
-        _,
+    /// A message from server to client
+    const Reply = struct {
+        // TODO
+    };
+
+    /// A message from server to client
+    const Event = struct {
+        // TODO
+    };
+
+    /// A message from client to server
+    const Command = union(Tag) {
+        Error: Error,
+        Timeout,
+        Reply,
+
+        CreatePlaybackStream,
+        DeletePlaybackStream,
+        CreateRecordStream,
+        DeleteRecordStream,
+        Exit,
+        Auth: AuthParams,
+        SetClientName: PropertyList,
+
+        pub fn read(reader: std.io.AnyReader, tag: Tag) !Command {
+            switch (tag) {
+                .Error => {
+                    const err: Error = @enumFromInt(try read_pa_u32(reader));
+                    return .{ .Error = err };
+                },
+                .Reply => {
+                    // Do nothing, the format is determined by what command is being responded to
+                    return .Reply;
+                },
+                .Auth => {
+                    const val: AuthParams = @bitCast(try read_pa_u32(reader));
+                    return .{ .Auth = val };
+                },
+                else => return error.Unimplemented,
+            }
+        }
+
+        const Tag = enum(u32) {
+            Error = 0,
+            Timeout = 1,
+            Reply = 2,
+
+            CreatePlaybackStream = 3,
+            DeletePlaybackStream = 4,
+            CreateRecordStream = 5,
+            DeleteRecordStream = 6,
+            Exit = 7,
+            Auth = 8,
+            SetClientName = 9,
+            _,
+        };
     };
     /// Tags copied from rust pulseaudio library: https://docs.rs/pulseaudio/latest/src/pulseaudio/protocol/serde/props.rs.html
     const Property = enum {
@@ -556,6 +712,38 @@ const PulseAudio = struct {
                 .MediaName => "media.name",
                 .MediaTitle => "media.title",
                 .MediaArtist => "media.artist",
+                .MediaCopyright => "media.copyright",
+                .MediaSoftware => "media.software",
+                .MediaLanguage => "media.language",
+                .MediaFilename => "media.filename",
+                .MediaIconName => "media.icon_name",
+                .MediaIcon => "media.icon",
+                .MediaRole => "media.role",
+                .FilterWant => "filter.want",
+                .FilterApply => "filter.apply",
+                .FilterSuppress => "filter.suppress",
+                .EventId => "event.id",
+                .EventDescription => "event.description",
+                .EventMouseX => "event.mouse.x",
+                .EventMouseY => "event.mouse.y",
+                .EventMouseHPos => "event.mouse.hpos",
+                .EventMouseVPos => "event.mouse.vpos",
+                .EventMouseButton => "event.mouse.button",
+                .WindowName => "window.name",
+                .WindowId => "window.id",
+                .WindowIconName => "window.icon_name",
+                .WindowIcon => "window.icon",
+                .WindowX => "window.x",
+                .WindowY => "window.y",
+                .WindowWidth => "window.width",
+                .WindowHeight => "window.height",
+                .WindowHPos => "window.hpos",
+                .WindowVPos => "window.vpos",
+                .WindowDesktop => "window.desktop",
+                .WindowX11Display => "window.x11.display",
+                .WindowX11Screen => "window.x11.screen",
+                .WindowX11Monitor => "window.x11.monitor",
+                .WindowX11Xid => "window.x11.xid",
                 .ApplicationName => "application.name",
                 .ApplicationId => "application.id",
                 .ApplicationVersion => "application.version",
@@ -568,7 +756,35 @@ const PulseAudio = struct {
                 .ApplicationProcessHost => "application.process.host",
                 .ApplicationProcessMachineId => "application.process.machine_id",
                 .ApplicationProcessSessionId => "application.process.session_id",
-                else => "TODO",
+                .DeviceString => "device.string",
+                .DeviceApi => "device.api",
+                .DeviceDescription => "device.description",
+                .DeviceBusPath => "device.bus_path",
+                .DeviceSerial => "device.serial",
+                .DeviceVendorId => "device.vendor.id",
+                .DeviceVendorName => "device.vendor.name",
+                .DeviceProductId => "device.product.id",
+                .DeviceProductName => "device.product.name",
+                .DeviceClass => "device.class",
+                .DeviceFormFactor => "device.form_factor",
+                .DeviceBus => "device.bus",
+                .DeviceIconName => "device.icon_name",
+                .DeviceIcon => "device.icon",
+                .DeviceAccessMode => "device.access_mode",
+                .DeviceMasterDevice => "device.master_device",
+                .DeviceBufferingBufferSize => "device.buffering.buffer_size",
+                .DeviceBufferingFragmentSize => "device.buffering.fragment_size",
+                .DeviceProfileName => "device.profile.name",
+                .DeviceIntendedRoles => "device.intended_roles",
+                .DeviceProfileDescription => "device.profile.description",
+                .ModuleAuthor => "module.author",
+                .ModuleDescription => "module.description",
+                .ModuleUsage => "module.usage",
+                .ModuleVersion => "module.version",
+                .FormatSampleFormat => "format.sample_format",
+                .FormatRate => "format.rate",
+                .FormatChannels => "format.channels",
+                .FormatChannelMap => "format.channel_map",
             };
         }
     };
