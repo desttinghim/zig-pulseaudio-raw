@@ -1,20 +1,14 @@
-const Tagstruct = @This();
-
-data: std.SegmentedList(u8, 128) = .{},
-r_index: usize = 0,
-
 const max_tag_size = (64 * 1024);
 
-// take index ptr, write buffer, value, "put" the value into the buffer, advancing the index ptr by the
-// amount written.
+// Public Declarations --------------------------------------------------------
 
-pub fn free(ts: *Tagstruct, allocator: std.mem.Allocator) void {
-    ts.data.clearAndFree(allocator);
-}
-
-const Error = error{
+pub const Error = error{
     OutOfSpace,
+    InvalidEnumTag,
+    TypeMismatch,
 };
+
+// --- Put Functions ----------------------------------------------------------
 
 pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
     if (buffer.len -| index.* < 1) return error.OutOfSpace;
@@ -25,7 +19,8 @@ pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
         if (write_to.len < length) return error.OutOfSpace;
         write_to[0] = @intFromEnum(Tag.String);
         @memcpy(write_to[1..][0..str.len], str);
-        if (length > str.len) write_to[length] = 0;
+        write_to[1 + str.len] = 0;
+        // if (length > str.len) write_to[length] = 0;
         index.* += length;
     } else {
         write_to[0] = @intFromEnum(Tag.StringNull);
@@ -275,7 +270,130 @@ test putFormatInfo {
     try std.testing.expectEqualSlices(u8, expected[0..], buffer[0..index]);
 }
 
-// --- Public Data Structures -------------------------------------------------
+// --- Get Functions ----------------------------------------------------------
+
+pub const Value = union(Value.Tag) {
+    String: [:0]const u8,
+    Arbitrary: []const u8,
+    Uint32: u32,
+    Uint8: u8,
+
+    pub const Tag = enum {
+        String,
+        Arbitrary,
+        Uint32,
+        Uint8,
+    };
+};
+
+pub fn getNextValue(index: *usize, buffer: []const u8) Error!?Value {
+    if (index.* >= buffer.len - 1) return null;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    switch (tag) {
+        .Invalid => return null,
+        .Uint32 => return .{ .Uint32 = try getU32(index, buffer) },
+        .Uint8 => return .{ .Uint8 = try getU8(index, buffer) },
+        .String => {
+            const str = std.mem.span(@as([*:0]const u8, @ptrCast(read_from[1..].ptr)));
+            index.* += 1 + str.len + 1; // +1 for tag, +1 for null
+            return .{ .String = str };
+        },
+        .Arbitrary => {
+            const length = std.mem.readInt(u32, read_from[1..5], .big);
+            index.* += 1 + length; // +1 for tag
+            return .{ .Arbitrary = read_from[5 .. 5 + length] };
+        },
+
+        .StringNull,
+        .Uint64,
+        .Sint64,
+        .SampleSpec,
+        .True,
+        .False,
+        .Time,
+        .Usec,
+        .ChannelMap,
+        .CVolume,
+        .PropList,
+        .Volume,
+        .FormatInfo,
+        => {
+            @panic("Unimplemented");
+        },
+    }
+
+    return null;
+}
+
+test getNextValue {
+    var buffer = [_]u8{0} ** 128;
+    var write_index: usize = 0;
+
+    try putString(&write_index, &buffer, "spaghetti");
+    try putU32(&write_index, &buffer, 0xCAFEBABE);
+    try putU32(&write_index, &buffer, 0xDEADBEEF);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{@intFromEnum(Tag.String)} ++ "spaghetti" ++ [_]u8{0}, buffer[0..11]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xCA, 0xFE, 0xBA, 0xBE }, buffer[11..16]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xDE, 0xAD, 0xBE, 0xEF }, buffer[16..21]);
+
+    var read_index: usize = 0;
+
+    const string = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
+    try std.testing.expectEqual(Value.Tag.String, @as(Value.Tag, string));
+    try std.testing.expectEqualSlices(u8, "spaghetti", string.String);
+
+    const int = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
+    try std.testing.expectEqual(Value{ .Uint32 = 0xCAFEBABE }, int);
+
+    const int2 = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
+    try std.testing.expectEqual(Value{ .Uint32 = 0xDEADBEEF }, int2);
+}
+
+pub fn getU32(index: *usize, buffer: []const u8) Error!u32 {
+    if (index.* > buffer.len - 5) return error.OutOfSpace;
+    const read_from = buffer[index.* .. index.* + 5];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Uint32) return error.TypeMismatch;
+
+    index.* += 5; // Only advance index if no error occurs
+
+    return std.mem.readInt(u32, read_from[1..5], .big);
+}
+
+pub fn getU8(index: *usize, buffer: []const u8) Error!u8 {
+    if (index.* > buffer.len - 2) return error.OutOfSpace;
+    const read_from = buffer[index.*..][0..2];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Uint8) return error.TypeMismatch;
+
+    index.* += 2; // Only advance index if no error occurs
+
+    return read_from[1];
+}
+
+// pub fn getString(index: *usize, buffer: []const u8) Error!?[]const u8 {
+//     if (buffer.len -| index.* < 1) return error.OutOfSpace;
+//     const write_to = buffer[index.*..];
+//     if (str_opt) |str| {
+//         const need_to_add_null = str[str.len - 1] != 0;
+//         const length = if (need_to_add_null) str.len + 2 else str.len + 1;
+//         if (write_to.len < length) return error.OutOfSpace;
+//         write_to[0] = @intFromEnum(Tag.String);
+//         @memcpy(write_to[1..][0..str.len], str);
+//         if (length > str.len) write_to[length] = 0;
+//         index.* += length;
+//     } else {
+//         write_to[0] = @intFromEnum(Tag.StringNull);
+//         index.* += 1;
+//     }
+// }
+
+// --- Data Structures --------------------------------------------------------
 pub const TimeVal = struct {
     sec: u32,
     usec: u32,
