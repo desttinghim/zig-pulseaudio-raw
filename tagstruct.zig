@@ -1,14 +1,25 @@
-const max_tag_size = (64 * 1024);
+//! # Tagstruct
+//!
+//! Tagstruct is the name of the Plain Old Data (P.O.D.) format used by
+//! PulseAudio to communicate between the client and the server. The encoding
+//! uses byte-sized tags to indicate the type of the following data, with the
+//! size of the data depending on the type. All numerical types are big-endian
+//! or network-order, since PulseAudio was designed to allow clients to connect
+//! over the network.
+//!
+//! This file contains functions for building tagstruct payloads (put* prefix),
+//! functions for parsing tagstruct payloads (get* prefix), and supporting type
+//! definitions (structs and enums for the various types).
 
 // Public Declarations --------------------------------------------------------
 
-pub const Error = error{
-    OutOfSpace,
-    InvalidEnumTag,
-    TypeMismatch,
-};
-
 // --- Put Functions ----------------------------------------------------------
+// ## Design Notes
+//
+// The put functions are designed to work with minimal supporting infrastructure
+// and to work without an allocator. Users may build payloads in a stack-
+// allocated or heap-allocated buffer, but they are responsible for the lifetime
+// of the buffer.
 
 pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
     if (buffer.len -| index.* < 1) return error.OutOfSpace;
@@ -19,8 +30,7 @@ pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
         if (write_to.len < length) return error.OutOfSpace;
         write_to[0] = @intFromEnum(Tag.String);
         @memcpy(write_to[1..][0..str.len], str);
-        write_to[1 + str.len] = 0;
-        // if (length > str.len) write_to[length] = 0;
+        if (length > str.len) write_to[length] = 0;
         index.* += length;
     } else {
         write_to[0] = @intFromEnum(Tag.StringNull);
@@ -271,18 +281,27 @@ test putFormatInfo {
 }
 
 // --- Get Functions ----------------------------------------------------------
+// ## Design notes
+//
+// The get functions have been designed to have a minimum amount of external
+// state. The lifetime of the data is equal to the lifetime of the underlying
+// message buffer. It should be possible to do all parsing without an allocator,
+// but for variable length data (like property lists!), helper functions may be
+// created to automatically create an ArrayList.
 
 pub const Value = union(Value.Tag) {
     String: [:0]const u8,
     Arbitrary: []const u8,
     Uint32: u32,
     Uint8: u8,
+    SampleSpec: SampleSpec,
 
     pub const Tag = enum {
         String,
         Arbitrary,
         Uint32,
         Uint8,
+        SampleSpec,
     };
 };
 
@@ -295,21 +314,13 @@ pub fn getNextValue(index: *usize, buffer: []const u8) Error!?Value {
         .Invalid => return null,
         .Uint32 => return .{ .Uint32 = try getU32(index, buffer) },
         .Uint8 => return .{ .Uint8 = try getU8(index, buffer) },
-        .String => {
-            const str = std.mem.span(@as([*:0]const u8, @ptrCast(read_from[1..].ptr)));
-            index.* += 1 + str.len + 1; // +1 for tag, +1 for null
-            return .{ .String = str };
-        },
-        .Arbitrary => {
-            const length = std.mem.readInt(u32, read_from[1..5], .big);
-            index.* += 1 + length; // +1 for tag
-            return .{ .Arbitrary = read_from[5 .. 5 + length] };
-        },
+        .String => return .{ .String = try getString(index, buffer) orelse "" },
+        .Arbitrary => return .{ .Arbitrary = try getArbitrary(index, buffer) },
+        .SampleSpec => return .{ .SampleSpec = try getSampleSpec(index, buffer) },
 
         .StringNull,
         .Uint64,
         .Sint64,
-        .SampleSpec,
         .True,
         .False,
         .Time,
@@ -328,16 +339,23 @@ pub fn getNextValue(index: *usize, buffer: []const u8) Error!?Value {
 }
 
 test getNextValue {
-    var buffer = [_]u8{0} ** 128;
+    var buffer = [_]u8{0} ** 256;
     var write_index: usize = 0;
 
     try putString(&write_index, &buffer, "spaghetti");
     try putU32(&write_index, &buffer, 0xCAFEBABE);
     try putU32(&write_index, &buffer, 0xDEADBEEF);
+    try putArbitrary(&write_index, &buffer, &.{ 69, 42, 0xAB, 0xCD });
+    try putSampleSpec(&write_index, &buffer, .{
+        .format = SampleSpec.Format.Alaw,
+        .channels = 2,
+        .sample_rate = 44100,
+    });
 
     try std.testing.expectEqualSlices(u8, &[_]u8{@intFromEnum(Tag.String)} ++ "spaghetti" ++ [_]u8{0}, buffer[0..11]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xCA, 0xFE, 0xBA, 0xBE }, buffer[11..16]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xDE, 0xAD, 0xBE, 0xEF }, buffer[16..21]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Arbitrary), 0, 0, 0, 4, 69, 42, 0xAB, 0xCD }, buffer[21..30]);
 
     var read_index: usize = 0;
 
@@ -350,6 +368,29 @@ test getNextValue {
 
     const int2 = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
     try std.testing.expectEqual(Value{ .Uint32 = 0xDEADBEEF }, int2);
+
+    const arbitrary = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
+    try std.testing.expectEqual(Value.Tag.Arbitrary, @as(Value.Tag, arbitrary));
+
+    const sample_spec = try getNextValue(&read_index, &buffer) orelse return error.UnexpectedEnd;
+    try std.testing.expectEqual(Value{ .SampleSpec = .{
+        .format = SampleSpec.Format.Alaw,
+        .channels = 2,
+        .sample_rate = 44100,
+    } }, sample_spec);
+}
+
+pub fn getString(index: *usize, buffer: []const u8) Error!?[:0]const u8 {
+    if (buffer.len -| index.* < 1) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag == .StringNull) return null;
+    if (tag != .String) return error.TypeMismatch;
+
+    const str = std.mem.span(@as([*:0]const u8, @ptrCast(read_from[1..].ptr)));
+    index.* += 1 + str.len + 1; // +1 for tag, +1 for null
+    return str;
 }
 
 pub fn getU32(index: *usize, buffer: []const u8) Error!u32 {
@@ -376,24 +417,53 @@ pub fn getU8(index: *usize, buffer: []const u8) Error!u8 {
     return read_from[1];
 }
 
-// pub fn getString(index: *usize, buffer: []const u8) Error!?[]const u8 {
-//     if (buffer.len -| index.* < 1) return error.OutOfSpace;
-//     const write_to = buffer[index.*..];
-//     if (str_opt) |str| {
-//         const need_to_add_null = str[str.len - 1] != 0;
-//         const length = if (need_to_add_null) str.len + 2 else str.len + 1;
-//         if (write_to.len < length) return error.OutOfSpace;
-//         write_to[0] = @intFromEnum(Tag.String);
-//         @memcpy(write_to[1..][0..str.len], str);
-//         if (length > str.len) write_to[length] = 0;
-//         index.* += length;
-//     } else {
-//         write_to[0] = @intFromEnum(Tag.StringNull);
-//         index.* += 1;
-//     }
-// }
+pub fn getArbitrary(index: *usize, buffer: []const u8) Error![]const u8 {
+    if (buffer.len -| index.* < 5) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
 
-// --- Data Structures --------------------------------------------------------
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Arbitrary) return error.TypeMismatch;
+    const length = std.mem.readInt(u32, read_from[1..5], .big);
+
+    index.* += 1 + 4 + length; // +1 for tag, +4 for length
+
+    return read_from[5..][0..length];
+}
+
+pub fn getSampleSpec(index: *usize, buffer: []const u8) Error!SampleSpec {
+    if (buffer.len -| index.* < 7) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .SampleSpec) return error.TypeMismatch;
+
+    const format = try std.meta.intToEnum(SampleSpec.Format, read_from[1]);
+    const channels = read_from[2];
+    const sample_rate = std.mem.readInt(u32, read_from[3..7], .big);
+
+    index.* += 7; // +1 for tag, +4 for length
+
+    return .{
+        .format = format,
+        .channels = channels,
+        .sample_rate = sample_rate,
+    };
+}
+
+// --- Data Types -------------------------------------------------------------
+// ## Design Notes
+//
+// The data structures in this file are primarily to support the basic parsing
+// functions. The intent is not necessarily to make it easy to manipulate the
+// types, so if the types are tedious to use that is unfortunate, but expected.
+// Higher level abstractions should be kept somewhere else.
+
+pub const Error = error{
+    OutOfSpace,
+    InvalidEnumTag,
+    TypeMismatch,
+};
+
 pub const TimeVal = struct {
     sec: u32,
     usec: u32,
@@ -533,37 +603,8 @@ const ParseError = error{
     StringNull,
 } || std.io.AnyReader.Error;
 
-// pub fn readString(reader: std.io.AnyReader, buf: []u8) ParseError![]u8 {
-//     switch (try reader.readEnum(Type, .big)) {
-//         .String => {},
-//         .StringNull => {
-//             return error.StringNull;
-//         },
-//         else => return error.TypeMismatch,
-//     }
-//     return reader.readUntilDelimiter(buf, 0);
-// }
-
-// /// A list associating string keys with arbitrary values,
-// /// usually strings.
-// pub const PropertyList = struct {
-//     pub const Property = struct {
-//         key: []const u8,
-//         value: []const u8,
-//     };
-
-//     pub fn readProperty(reader: std.io.AnyReader, key_buf: []u8, value_buf: []u8) !?Property {
-//         const key = readString(reader, key_buf) catch |e| switch (e) {
-//             error.StringNull => return null,
-//             else => return e,
-//         };
-//         const value = try readString(reader, value_buf);
-//         return .{
-//             .key = key,
-//             .value = value,
-//         };
-//     }
-// };
+// --- Includes and Constants -------------------------------------------------
+const max_tag_size = (64 * 1024);
 
 const std = @import("std");
 const builtin = @import("builtin");
