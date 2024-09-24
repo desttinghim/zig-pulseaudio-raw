@@ -19,13 +19,13 @@ pub fn main() !void {
     const app_name = std.fs.path.basename(app_path);
     const app_id = try std.fmt.bufPrint(&buf_id, "{}", .{std.os.linux.getpid()});
 
-    var list = PulseAudio.PropertyList.init(.{
-        .MediaRole = "game",
-        .ApplicationName = app_name,
-        .ApplicationProcessId = app_id,
-        .ApplicationProcessBinary = app_path,
-        .ApplicationLanguage = "en_US.UTF8",
-    });
+    var list = [_]tagstruct.Prop{
+        .{ Property.MediaRole.to_string(), "game" },
+        .{ Property.ApplicationName.to_string(), app_name },
+        .{ Property.ApplicationProcessId.to_string(), app_id },
+        .{ Property.ApplicationProcessBinary.to_string(), app_path },
+        .{ Property.ApplicationLanguage.to_string(), "en_US.UTF8" },
+    };
     pa.set_client_name(&list) catch |e| {
         std.log.info("Error Code: {?}", .{pa.error_code});
         return e;
@@ -59,8 +59,6 @@ const PulseAudio = struct {
     error_code: ?ErrorCode = null,
     buf_write: [1024]u8 = .{0} ** 1024,
     buf_read: [1024]u8 = .{0} ** 1024,
-    fbs_write: std.io.FixedBufferStream([]u8) = undefined,
-    fbs_read: std.io.FixedBufferStream([]u8) = undefined,
     socket: ?std.net.Stream = null,
 
     const Context = struct {
@@ -89,23 +87,21 @@ const PulseAudio = struct {
         const cookie = try get_pa_cookie(allocator);
         defer allocator.free(cookie);
 
-        pa.fbs_write = std.io.fixedBufferStream(&pa.buf_write);
+        var write_index: usize = 0;
 
-        const writer = pa.fbs_write.writer();
+        try putHeader(&write_index, &pa.buf_write, .{});
+        try putCommand(&write_index, &pa.buf_write, Command.Tag.Auth, pa.get_next_seq());
+        try tagstruct.putU32(&write_index, &pa.buf_write, version);
+        try tagstruct.putArbitrary(&write_index, &pa.buf_write, cookie);
+        write_finish(&pa.buf_write, write_index);
 
-        try pa.write_pa_header(writer.any(), Command.Tag.Auth);
-        try write_pa_u32(writer.any(), version);
-        try write_pa_arbitrary(writer.any(), cookie);
+        std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(pa.buf_write[0..write_index])});
 
-        const msg = try pa.write_finish();
-
-        try pa.socket.?.writeAll(msg);
+        try pa.socket.?.writeAll(pa.buf_write[0..write_index]);
 
         const count = try pa.socket.?.read(&pa.buf_read);
 
         const read_from = pa.buf_read[0..count];
-
-        std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(read_from)});
 
         var index: usize = 0;
         const header = try read_pa_header(&index, read_from);
@@ -135,26 +131,17 @@ const PulseAudio = struct {
 
     const PropertyList = std.EnumMap(Property, []const u8);
 
-    pub fn set_client_name(pa: *PulseAudio, list: *PropertyList) !void {
-        pa.fbs_write.reset();
+    pub fn set_client_name(pa: *PulseAudio, list: tagstruct.PropList) !void {
+        var write_index: usize = 0;
 
-        const writer = pa.fbs_write.writer().any();
+        try putHeader(&write_index, &pa.buf_write, .{});
+        try putCommand(&write_index, &pa.buf_write, Command.Tag.SetClientName, pa.get_next_seq());
+        try tagstruct.putPropList(&write_index, &pa.buf_write, list);
+        write_finish(&pa.buf_write, write_index);
 
-        try pa.write_pa_header(writer, Command.Tag.SetClientName);
+        std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(pa.buf_write[0..write_index])});
 
-        try writer.writeByte(@intFromEnum(Type.PropList));
-
-        var iter = list.iterator();
-
-        while (iter.next()) |item| {
-            try write_pa_property(writer, item.key.to_string(), item.value.*);
-        }
-
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.StringNull));
-
-        const msg = try pa.write_finish();
-
-        try pa.socket.?.writeAll(msg);
+        try pa.socket.?.writeAll(pa.buf_write[0..write_index]);
 
         // Response
         const count = try pa.socket.?.read(&pa.buf_read);
@@ -200,30 +187,12 @@ const PulseAudio = struct {
         return bin_cookie;
     }
 
-    pub fn write_pa_property(writer: std.io.AnyWriter, key: []const u8, value: []const u8) !void {
-        // write out key string
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.String));
-        try writer.writeAll(key);
-        try writer.writeByte(0); // null terminator
-
-        // write out length of value
-        const length: u32 = @intCast(value.len + 1);
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Uint32));
-        try writer.writeInt(u32, length, .big);
-
-        // write out value
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Arbitrary));
-        try writer.writeInt(u32, length, .big);
-        try writer.writeAll(value);
-        try writer.writeByte(0); // null terminator
-    }
-
     const Header = struct {
-        length: u32,
-        channel: u32,
-        offset_hi: u32,
-        offset_lo: u32,
-        flags: u32,
+        length: u32 = 0,
+        channel: u32 = 0xFFFF_FFFF,
+        offset_hi: u32 = 0,
+        offset_lo: u32 = 0,
+        flags: u32 = 0,
     };
 
     const Packet = struct {
@@ -258,41 +227,29 @@ const PulseAudio = struct {
         return tag;
     }
 
-    pub fn write_pa_header(pa: *PulseAudio, writer: std.io.AnyWriter, command: Command.Tag) !void {
-        try writer.writeInt(u32, 0x0, .big); // length - this will be fixed up later
-        try writer.writeInt(u32, 0xff_ff_ff_ff, .big); // channel
-        try writer.writeInt(u32, 0x0, .big); // offset high
-        try writer.writeInt(u32, 0x0, .big); // offset low
-        try writer.writeInt(u32, 0x0, .big); // flags
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Uint32)); // type tag
-        try writer.writeInt(u32, @intFromEnum(command), .big); // command
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Uint32)); // type tag
-        try writer.writeInt(u32, pa.get_next_seq(), .big); // seq
+    pub fn putHeader(index: *usize, buffer: []u8, header: Header) !void {
+        if (index.* + 20 > buffer.len) return error.OutOfSpace;
+        const write_to = buffer[index.*..];
+
+        // Most likely, the header length is not final and will need to be adjusted
+        std.mem.writeInt(u32, write_to[0..][0..4], header.length, .big);
+        std.mem.writeInt(u32, write_to[4..][0..4], header.channel, .big);
+        std.mem.writeInt(u32, write_to[8..][0..4], header.offset_hi, .big);
+        std.mem.writeInt(u32, write_to[12..][0..4], header.offset_lo, .big);
+        std.mem.writeInt(u32, write_to[16..][0..4], header.flags, .big);
+
+        index.* += 20;
     }
 
-    pub fn write_finish(pa: *PulseAudio) ![]const u8 {
-        const written = pa.fbs_write.getWritten();
-        try pa.fbs_write.seekTo(0);
-        const writer = pa.fbs_write.writer();
-        try writer.writeInt(u32, @intCast(written.len - 20), .big);
-        return written;
+    pub fn putCommand(index: *usize, buffer: []u8, command: Command.Tag, seq: u32) !void {
+        if (index.* + 10 > buffer.len) return error.OutOfSpace;
+
+        try tagstruct.putU32(index, buffer, @intFromEnum(command));
+        try tagstruct.putU32(index, buffer, seq);
     }
 
-    pub fn write_pa_u32(writer: std.io.AnyWriter, int: u32) !void {
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Uint32)); // type tag
-        try writer.writeInt(u32, int, .big); // seq
-    }
-
-    pub fn read_pa_u32(reader: std.io.AnyReader) !u32 {
-        if (try reader.readEnum(PulseAudio.Type, .big) != .Uint32) return error.UintTagNotFound;
-        const int = try reader.readInt(u32, .big); // seq
-        return int;
-    }
-
-    pub fn write_pa_arbitrary(writer: std.io.AnyWriter, blob: []const u8) !void {
-        try writer.writeByte(@intFromEnum(PulseAudio.Type.Arbitrary)); // type tag
-        try writer.writeInt(u32, @intCast(blob.len), .big); // seq
-        try writer.writeAll(blob);
+    pub fn write_finish(buffer: []u8, final_length: usize) void {
+        std.mem.writeInt(u32, buffer[0..4], @intCast(final_length - 20), .big);
     }
 
     pub fn get_next_seq(pa: *PulseAudio) u32 {
@@ -447,24 +404,6 @@ const PulseAudio = struct {
         Exit,
         Auth: AuthParams,
         SetClientName: PropertyList,
-
-        pub fn read(reader: std.io.AnyReader, tag: Tag) !Command {
-            switch (tag) {
-                .Error => {
-                    const err: ErrorCode = @enumFromInt(try read_pa_u32(reader));
-                    return .{ .Error = err };
-                },
-                .Reply => {
-                    // Do nothing, the format is determined by what command is being responded to
-                    return .Reply;
-                },
-                .Auth => {
-                    const val: AuthParams = @bitCast(try read_pa_u32(reader));
-                    return .{ .Auth = val };
-                },
-                else => return error.Unimplemented,
-            }
-        }
 
         const Tag = enum(u32) {
             Error = 0,

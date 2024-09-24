@@ -30,7 +30,7 @@ pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
         if (write_to.len < length) return error.OutOfSpace;
         write_to[0] = @intFromEnum(Tag.String);
         @memcpy(write_to[1..][0..str.len], str);
-        if (length > str.len) write_to[length] = 0;
+        if (length > str.len) write_to[length - 1] = 0;
         index.* += length;
     } else {
         write_to[0] = @intFromEnum(Tag.StringNull);
@@ -41,8 +41,12 @@ pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
 test putString {
     var buffer = [_]u8{0} ** 128;
     var index: usize = 0;
+
     try putString(&index, &buffer, "application.name");
-    const expected = [_]u8{@intFromEnum(Tag.String)} ++ "application.name\x00";
+    try putString(&index, &buffer, null);
+
+    const expected = [_]u8{@intFromEnum(Tag.String)} ++ "application.name\x00" ++ .{@intFromEnum(Tag.StringNull)};
+
     try std.testing.expectEqualSlices(u8, expected, buffer[0..index]);
 }
 
@@ -115,6 +119,16 @@ pub fn putArbitrary(index: *usize, buffer: []u8, bytes: []const u8) !void {
     std.mem.writeInt(u32, write_to[1..5], @intCast(bytes.len), .big);
     @memcpy(write_to[5..][0..bytes.len], bytes);
     index.* += 5 + bytes.len;
+}
+
+pub fn putArbitraryWithNull(index: *usize, buffer: []u8, bytes: []const u8) !void {
+    if (buffer.len -| index.* < 5 + bytes.len + 1) return error.OutOfSpace;
+    const write_to = buffer[index.*..];
+    write_to[0] = @intFromEnum(Tag.Arbitrary);
+    std.mem.writeInt(u32, write_to[1..5], @intCast(bytes.len + 1), .big);
+    @memcpy(write_to[5..][0..bytes.len], bytes);
+    write_to[5 + bytes.len + 1] = 0;
+    index.* += 5 + bytes.len + 1;
 }
 
 pub fn putBoolean(index: *usize, buffer: []u8, value: bool) !void {
@@ -210,8 +224,8 @@ pub fn putPropList(index: *usize, buffer: []u8, prop_list: PropList) !void {
     index.* += 1;
     for (prop_list) |item| {
         try putString(index, buffer, item[0]);
-        try putU32(index, buffer, @intCast(item[1].len));
-        try putArbitrary(index, buffer, item[1]);
+        try putU32(index, buffer, @intCast(item[1].len + 1));
+        try putArbitraryWithNull(index, buffer, item[1]);
     }
     try putString(index, buffer, null);
 }
@@ -254,27 +268,31 @@ test putFormatInfo {
         @intFromEnum(Tag.String),
     } ++ comptime Property.FormatSampleFormat.to_string() ++ .{
         0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 5, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 5, // Length again
+        @intFromEnum(Tag.Uint32), 0, 0, 0, 6, // Length
+        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 6, // Length again
     } ++ "float" ++ .{
+        0, // null terminator
         @intFromEnum(Tag.String),
     } ++ Property.FormatRate.to_string() ++ .{
         0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 5, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 5, // Length again
+        @intFromEnum(Tag.Uint32), 0, 0, 0, 6, // Length
+        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 6, // Length again
     } ++ "44100" ++ .{
+        0, // null terminator
         @intFromEnum(Tag.String),
     } ++ Property.FormatChannels.to_string() ++ .{
         0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 1, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 1, // Length again
+        @intFromEnum(Tag.Uint32), 0, 0, 0, 2, // Length
+        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 2, // Length again
     } ++ "2" ++ .{
+        0, // null terminator
         @intFromEnum(Tag.String),
     } ++ Property.FormatChannelMap.to_string() ++ .{
         0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 6, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 6, // Length again
+        @intFromEnum(Tag.Uint32), 0, 0, 0, 7, // Length
+        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 7, // Length again
     } ++ "stereo" ++ .{
+        0, // null terminator
         @intFromEnum(Tag.StringNull),
     };
     try std.testing.expectEqualSlices(u8, expected[0..], buffer[0..index]);
@@ -733,8 +751,8 @@ pub const SampleSpec = struct {
         );
     };
 };
-const MAX_CHANNELS = 32;
-const ChannelMap = struct {
+pub const MAX_CHANNELS = 32;
+pub const ChannelMap = struct {
     channels: u8,
     map: [MAX_CHANNELS]Position = [_]Position{.Mono} ** MAX_CHANNELS,
     const Position = enum(u8) {
@@ -853,7 +871,7 @@ pub const Volume = enum(u32) {
         return @enumFromInt(@max(muted, @min(vol, max)));
     }
 };
-const CVolume = struct {
+pub const CVolume = struct {
     channels: u8,
     volumes: [MAX_CHANNELS]Volume = [_]Volume{@enumFromInt(0)} ** MAX_CHANNELS,
 
@@ -865,9 +883,9 @@ const CVolume = struct {
         return true;
     }
 };
-const Prop = struct { []const u8, []const u8 };
-const PropList = []const Prop;
-const FormatEncoding = enum {
+pub const Prop = struct { []const u8, []const u8 };
+pub const PropList = []const Prop;
+pub const FormatEncoding = enum {
     Any,
     PCM,
     AC3_IEC61937,
@@ -878,7 +896,7 @@ const FormatEncoding = enum {
     TRUEHD_IEC61937,
     DTSHD_IEC61937,
 };
-const FormatInfo = struct {
+pub const FormatInfo = struct {
     encoding: FormatEncoding,
     props: PropList,
 };
