@@ -177,14 +177,14 @@ pub fn putChannelMap(index: *usize, buffer: []u8, map: ChannelMap) Error!void {
 }
 
 pub fn putCVolume(index: *usize, buffer: []u8, c_volume: CVolume) Error!void {
-    if (buffer.len -| index.* < 2 + c_volume.channels) return error.OutOfSpace;
+    if (buffer.len -| index.* < 2 + c_volume.channels * 4) return error.OutOfSpace;
     const write_to = buffer[index.*..];
     write_to[0] = @intFromEnum(Tag.CVolume);
     write_to[1] = c_volume.channels;
-    for (0..@intCast(c_volume.channels)) |i| {
-        write_to[2 + i] = c_volume.volumes[i];
+    for (0..@intCast(c_volume.channels), c_volume.volumes[0..c_volume.channels]) |i, volume| {
+        std.mem.writeInt(u32, write_to[2..][i * 4 ..][0..4], @intFromEnum(volume), .big);
     }
-    index.* += 2 + c_volume.channels;
+    index.* += 2 + c_volume.channels * 4;
 }
 
 pub fn putVolume(index: *usize, buffer: []u8, volume: Volume) !void {
@@ -572,12 +572,30 @@ pub fn getCVolume(index: *usize, buffer: []const u8) Error!CVolume {
     var cvolume = CVolume{ .channels = count };
 
     for (0..count) |i| {
-        cvolume.volumes[i] = std.mem.readInt(u32, read_from[2..][i * 4 ..][0..4], .big);
+        cvolume.volumes[i] = @enumFromInt(std.mem.readInt(u32, read_from[2..][i * 4 ..][0..4], .big));
     }
 
     index.* += 2 + cvolume.channels * 4; // Only advance index if no error occurs
 
     return cvolume;
+}
+
+test getCVolume {
+    var buffer = [_]u8{0} ** 256;
+    var write_index: usize = 0;
+
+    var cvolume_original = CVolume{
+        .channels = 2,
+    };
+    cvolume_original.volumes[0] = .Normal;
+    cvolume_original.volumes[1] = Volume.from_dB(1.0);
+
+    try putCVolume(&write_index, &buffer, cvolume_original);
+
+    var read_index: usize = 0;
+
+    const cvolume = try getCVolume(&read_index, &buffer);
+    try std.testing.expectEqual(cvolume_original, cvolume);
 }
 
 pub fn getVolume(index: *usize, buffer: []const u8) Error!Volume {
@@ -592,6 +610,26 @@ pub fn getVolume(index: *usize, buffer: []const u8) Error!Volume {
     index.* += size; // Only advance index if no error occurs
 
     return @enumFromInt(int);
+}
+
+test getVolume {
+    var buffer = [_]u8{0} ** 256;
+    var write_index: usize = 0;
+
+    try putVolume(&write_index, &buffer, Volume.Normal);
+    try putVolume(&write_index, &buffer, Volume.Muted);
+    try putVolume(&write_index, &buffer, Volume.Max);
+
+    var read_index: usize = 0;
+
+    const volume1 = try getVolume(&read_index, &buffer);
+    try std.testing.expectEqual(Volume.Normal, volume1);
+
+    const volume2 = try getVolume(&read_index, &buffer);
+    try std.testing.expectEqual(Volume.Muted, volume2);
+
+    const volume3 = try getVolume(&read_index, &buffer);
+    try std.testing.expectEqual(Volume.Max, volume3);
 }
 
 pub fn getPropList(index: *usize, buffer: []const u8) Error!PropList {
@@ -765,14 +803,67 @@ const ChannelMap = struct {
 
     pub fn fromString(str: []const u8) ChannelMap {
         _ = str;
-        // TODO!
-        return undefined;
+        @panic("unimplemented");
     }
 };
-const Volume = enum(u32) { _ };
+pub const Volume = enum(u32) {
+    /// Minimal valid volume (0%, -inf dB)
+    Muted = 0,
+    /// Normal volume (100%, 0 dB)
+    Normal = normal,
+    /// Maximum valid volume we can store
+    Max = std.math.maxInt(u32) / 2,
+    /// Recommended maximum value to show in user facing UIs.
+    MaxUI = max_ui: {
+        const linear = dB_to_linear(11.0);
+        break :max_ui @intFromFloat(@round(std.math.cbrt(linear) * normal));
+    },
+    /// Special 'invalid' volume
+    Invalid = std.math.maxInt(u32),
+    _,
+
+    const decibel_min_infinity = 0;
+    const normal = 0x10_000;
+
+    pub fn linear_to_dB(v: f64) f64 {
+        return 20.0 * std.math.log10(v);
+    }
+
+    pub fn dB_to_linear(v: f64) f64 {
+        return std.math.pow(f64, 10.0, v / 20.0);
+    }
+
+    pub fn from_linear(v: f64) Volume {
+        if (v <= 0.0) return .Muted;
+        // pulseaudio/volume.c mentions that cubic mapping is used here.
+        return clamp(@enumFromInt(@as(u64, @intFromFloat(@round(std.math.cbrt(v) * normal)))));
+    }
+
+    pub fn from_dB(dB: f64) Volume {
+        if (std.math.isInf(dB) or std.math.isNegativeInf(dB))
+            return .Muted;
+
+        return from_linear(dB_to_linear(dB));
+    }
+
+    pub fn clamp(volume: Volume) Volume {
+        const vol = @intFromEnum(volume);
+        const muted = @intFromEnum(Volume.Muted);
+        const max = @intFromEnum(Volume.Max);
+        return @enumFromInt(@max(muted, @min(vol, max)));
+    }
+};
 const CVolume = struct {
     channels: u8,
-    volumes: [MAX_CHANNELS]Volume = [_]u32{@enumFromInt(0)} ** MAX_CHANNELS,
+    volumes: [MAX_CHANNELS]Volume = [_]Volume{@enumFromInt(0)} ** MAX_CHANNELS,
+
+    pub fn eq(lhs: CVolume, rhs: CVolume) bool {
+        if (lhs.channels != rhs.channels) return false;
+        for (lhs.volumes[0..lhs.channels], rhs.volumes[0..rhs.channels]) |lv, rv| {
+            if (lv != rv) return false;
+        }
+        return true;
+    }
 };
 const Prop = struct { []const u8, []const u8 };
 const PropList = []const Prop;
