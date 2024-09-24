@@ -56,7 +56,7 @@ pub fn main() !void {
 const PulseAudio = struct {
     seq: u32 = 0,
     client_index: u32 = 0,
-    error_code: ?Error = null,
+    error_code: ?ErrorCode = null,
     buf_write: [1024]u8 = .{0} ** 1024,
     buf_read: [1024]u8 = .{0} ** 1024,
     fbs_write: std.io.FixedBufferStream([]u8) = undefined,
@@ -170,7 +170,7 @@ const PulseAudio = struct {
 
         if (command != .Reply) {
             std.debug.assert(command == .Error);
-            pa.error_code = try std.meta.intToEnum(Error, try tagstruct.getU32(&index, read_from));
+            pa.error_code = try std.meta.intToEnum(ErrorCode, try tagstruct.getU32(&index, read_from));
             return error.UnexpectedCommand;
         }
 
@@ -231,22 +231,6 @@ const PulseAudio = struct {
         seq: u32,
         command: Command,
     };
-
-    pub fn read_packet(reader: std.io.AnyReader) !Packet {
-        const header = try read_pa_header(reader);
-        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
-        const command_tag = try reader.readEnum(Command.Tag, .big);
-        if (try reader.readEnum(Type, .big) != Type.Uint32) return error.MissingTag;
-        const seq = try reader.readInt(u32, .big);
-
-        const command = try Command.read(reader, command_tag);
-
-        return .{
-            .header = header,
-            .seq = seq,
-            .command = command,
-        };
-    }
 
     pub fn read_pa_header(index: *usize, buffer: []const u8) !Header {
         if (index.* > buffer.len -| 20) return error.EndOfStream;
@@ -391,7 +375,7 @@ const PulseAudio = struct {
         flags: StreamFlags,
     };
 
-    const Error = enum(u32) {
+    const ErrorCode = enum(u32) {
         AccessDenied = 1,
         Command = 2,
         Invalid = 3,
@@ -418,7 +402,6 @@ const PulseAudio = struct {
         Forked = 24,
         Io = 25,
         Busy = 26,
-        _,
     };
     const Type = enum(u8) {
         Invalid = 0,
@@ -439,7 +422,6 @@ const PulseAudio = struct {
         PropList = 'P',
         Volume = 'V',
         FormatInfo = 'f',
-        _,
     };
 
     /// A message from server to client
@@ -454,7 +436,7 @@ const PulseAudio = struct {
 
     /// A message from client to server
     const Command = union(Tag) {
-        Error: Error,
+        Error: ErrorCode,
         Timeout,
         Reply,
 
@@ -469,7 +451,7 @@ const PulseAudio = struct {
         pub fn read(reader: std.io.AnyReader, tag: Tag) !Command {
             switch (tag) {
                 .Error => {
-                    const err: Error = @enumFromInt(try read_pa_u32(reader));
+                    const err: ErrorCode = @enumFromInt(try read_pa_u32(reader));
                     return .{ .Error = err };
                 },
                 .Reply => {

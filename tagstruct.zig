@@ -171,7 +171,7 @@ pub fn putChannelMap(index: *usize, buffer: []u8, map: ChannelMap) Error!void {
     write_to[0] = @intFromEnum(Tag.ChannelMap);
     write_to[1] = map.channels;
     for (0..@intCast(map.channels)) |i| {
-        write_to[2 + i] = map.map[i];
+        write_to[2 + i] = @intFromEnum(map.map[i]);
     }
     index.* += 2 + map.channels;
 }
@@ -311,7 +311,7 @@ pub fn getNextValue(index: *usize, buffer: []const u8) Error!?Value {
 
     const tag = try std.meta.intToEnum(Tag, read_from[0]);
     switch (tag) {
-        .Invalid => return null,
+        .Invalid => return error.InvalidEnumTag,
         .Uint32 => return .{ .Uint32 = try getU32(index, buffer) },
         .Uint8 => return .{ .Uint8 = try getU8(index, buffer) },
         .String => return .{ .String = try getString(index, buffer) orelse "" },
@@ -450,6 +450,162 @@ pub fn getSampleSpec(index: *usize, buffer: []const u8) Error!SampleSpec {
     };
 }
 
+pub fn getBool(index: *usize, buffer: []const u8) Error!bool {
+    if (index.* > buffer.len - 1) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .True and tag != .False) return error.TypeMismatch;
+    const value = tag == .True;
+
+    index.* += 1; // Only advance index if no error occurs
+
+    return value;
+}
+
+pub fn getTimeVal(index: *usize, buffer: []const u8) Error!TimeVal {
+    if (index.* > buffer.len - 9) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Time) return error.TypeMismatch;
+    const sec = std.mem.readInt(u32, read_from[1..5], .big);
+    const usec = std.mem.readInt(u32, read_from[5..9], .big);
+
+    index.* += 9; // Only advance index if no error occurs
+
+    return .{ .sec = sec, .usec = usec };
+}
+
+pub fn getUsec(index: *usize, buffer: []const u8) Error!Usec {
+    if (index.* > buffer.len - 9) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Usec) return error.TypeMismatch;
+    const sec = std.mem.readInt(u64, read_from[1..9], .big);
+
+    index.* += 9; // Only advance index if no error occurs
+
+    return sec;
+}
+
+pub fn getU64(index: *usize, buffer: []const u8) Error!u64 {
+    if (index.* > buffer.len - 9) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Uint64) return error.TypeMismatch;
+    const int = std.mem.readInt(u64, read_from[1..9], .big);
+
+    index.* += 9; // Only advance index if no error occurs
+
+    return int;
+}
+
+pub fn getS64(index: *usize, buffer: []const u8) Error!i64 {
+    if (index.* > buffer.len - 9) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Uint64) return error.TypeMismatch;
+    const int = std.mem.readInt(i64, read_from[1..9], .big);
+
+    index.* += 9; // Only advance index if no error occurs
+
+    return int;
+}
+
+pub fn getChannelMap(index: *usize, buffer: []const u8) Error!ChannelMap {
+    // NOTE: This type has a variable size, this first check is the
+    // bare minimum size for it to be a valid value
+    if (index.* > buffer.len - 2) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .ChannelMap) return error.TypeMismatch;
+    const count = read_from[1];
+
+    if (index.* > buffer.len - 2 - count) return error.OutOfSpace;
+
+    var channel_map = ChannelMap{ .channels = count };
+
+    for (0..count, read_from[2..][0..count]) |i, position| {
+        channel_map.map[i] = @enumFromInt(position);
+    }
+
+    index.* += 2 + channel_map.channels * 4; // Only advance index if no error occurs
+
+    return channel_map;
+}
+
+test getChannelMap {
+    var buffer = [_]u8{0} ** 256;
+    var write_index: usize = 0;
+
+    var channel_map_original = ChannelMap{
+        .channels = 2,
+    };
+    channel_map_original.map[0] = .FrontLeft;
+    channel_map_original.map[1] = .FrontRight;
+
+    try putChannelMap(&write_index, &buffer, channel_map_original);
+
+    var read_index: usize = 0;
+
+    const channel_map = try getChannelMap(&read_index, &buffer);
+    try std.testing.expectEqual(channel_map_original, channel_map);
+}
+
+pub fn getCVolume(index: *usize, buffer: []const u8) Error!CVolume {
+    // NOTE: This type has a variable size, this first check is the
+    // bare minimum size for it to be a valid value
+    if (index.* > buffer.len - 2) return error.OutOfSpace;
+    const read_from = buffer[index.*..];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .CVolume) return error.TypeMismatch;
+    const count = read_from[1];
+
+    if (index.* > buffer.len - 2 - (count * 4)) return error.OutOfSpace;
+
+    var cvolume = CVolume{ .channels = count };
+
+    for (0..count) |i| {
+        cvolume.volumes[i] = std.mem.readInt(u32, read_from[2..][i * 4 ..][0..4], .big);
+    }
+
+    index.* += 2 + cvolume.channels * 4; // Only advance index if no error occurs
+
+    return cvolume;
+}
+
+pub fn getVolume(index: *usize, buffer: []const u8) Error!Volume {
+    const size = 5;
+    if (index.* > buffer.len - size) return error.OutOfSpace;
+    const read_from = buffer[index.*..][0..size];
+
+    const tag = try std.meta.intToEnum(Tag, read_from[0]);
+    if (tag != .Volume) return error.TypeMismatch;
+    const int = std.mem.readInt(u32, read_from[1..size], .big);
+
+    index.* += size; // Only advance index if no error occurs
+
+    return @enumFromInt(int);
+}
+
+pub fn getPropList(index: *usize, buffer: []const u8) Error!PropList {
+    // TODO
+    _ = index;
+    _ = buffer;
+}
+
+pub fn getFormatInfo(index: *usize, buffer: []const u8) Error!FormatInfo {
+    // TODO
+    _ = index;
+    _ = buffer;
+}
+
 // --- Data Types -------------------------------------------------------------
 // ## Design Notes
 //
@@ -542,8 +698,70 @@ pub const SampleSpec = struct {
 const MAX_CHANNELS = 32;
 const ChannelMap = struct {
     channels: u8,
-    map: [MAX_CHANNELS]Position,
-    const Position = enum {};
+    map: [MAX_CHANNELS]Position = [_]Position{.Mono} ** MAX_CHANNELS,
+    const Position = enum(u8) {
+        Mono = 0,
+
+        FrontLeft,
+        FrontRight,
+        FrontCenter,
+
+        RearCenter,
+        RearLeft,
+        RearRight,
+
+        Subwoofer,
+
+        FrontLeftOfCenter,
+        FrontRightOfCenter,
+
+        SideLeft,
+        SideRight,
+
+        Aux1,
+        Aux2,
+        Aux3,
+        Aux4,
+        Aux5,
+        Aux6,
+        Aux7,
+        Aux8,
+        Aux9,
+        Aux10,
+        Aux11,
+        Aux12,
+        Aux13,
+        Aux14,
+        Aux15,
+        Aux16,
+        Aux17,
+        Aux18,
+        Aux19,
+        Aux20,
+        Aux21,
+        Aux22,
+        Aux23,
+        Aux24,
+        Aux25,
+        Aux26,
+        Aux27,
+        Aux28,
+        Aux29,
+        Aux30,
+        Aux31,
+
+        TopCenter,
+
+        TopFrontLeft,
+        TopFrontRight,
+        TopFrontCenter,
+
+        TopRearLeft,
+        TopRearRight,
+        TopRearCenter,
+
+        const LFE = Position.Subwoofer;
+    };
 
     pub fn fromString(str: []const u8) ChannelMap {
         _ = str;
@@ -554,7 +772,7 @@ const ChannelMap = struct {
 const Volume = enum(u32) { _ };
 const CVolume = struct {
     channels: u8,
-    volumes: [MAX_CHANNELS]Volume,
+    volumes: [MAX_CHANNELS]Volume = [_]u32{@enumFromInt(0)} ** MAX_CHANNELS,
 };
 const Prop = struct { []const u8, []const u8 };
 const PropList = []const Prop;
