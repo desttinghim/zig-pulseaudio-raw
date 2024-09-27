@@ -228,7 +228,7 @@ pub const Property = enum {
     /// For PCM formats: the channel map of the stream as returned by pa_channel_map_snprint() \since 1.0
     FormatChannelMap,
 
-    pub fn to_string(prop: Property) []const u8 {
+    pub fn to_string(prop: Property) [:0]const u8 {
         return switch (prop) {
             .MediaName => "media.name",
             .MediaTitle => "media.title",

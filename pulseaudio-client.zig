@@ -16,8 +16,9 @@ pub fn main() !void {
     var buf_id: [32]u8 = .{0} ** 32;
 
     const app_path = std.mem.span(std.os.argv[0]);
-    const app_name = std.fs.path.basename(app_path);
-    const app_id = try std.fmt.bufPrint(&buf_id, "{}", .{std.os.linux.getpid()});
+    const app_name = try allocator.dupeZ(u8, std.fs.path.basename(app_path));
+    defer allocator.free(app_name);
+    const app_id = try std.fmt.bufPrintZ(&buf_id, "{}", .{std.os.linux.getpid()});
 
     var list = [_]tagstruct.Prop{
         .{ Property.MediaRole.to_string(), "game" },
@@ -33,25 +34,146 @@ pub fn main() !void {
 
     std.log.info("Client Index: {}", .{pa.client_index});
 
+    // pa.stream_new(.{
+    //     .name = "pa-zig",
+    // });
+
+    const params = PulseAudio.PlaybackStreamParams{
+        .sample_spec = .{
+            .format = .Uint8,
+            .channels = 2,
+            .sample_rate = 44_100,
+        },
+        .channel_map = .{
+            .channels = 2,
+            .map = [_]tagstruct.ChannelMap.Position{ .FrontLeft, .FrontRight } ++ [_]tagstruct.ChannelMap.Position{.Mono} ** 30,
+        },
+        .sink_index = null,
+        .sink_name = "Zig PA Client",
+        .buffer_attr = .{
+            .max_length = 0,
+            .target_length = 0,
+            .pre_buffering = 0,
+            .minimum_request_length = 0,
+            .fragment_size = 0,
+        },
+        .sync_id = 1,
+        .cvolume = .{
+            .channels = 1,
+            .volumes = [_]tagstruct.Volume{.Normal} ** 32,
+        },
+        .props = &[_]tagstruct.Prop{},
+        .formats = &[_]tagstruct.FormatInfo{},
+        .flags = PulseAudio.Stream.Flags{},
+    };
+
+    var buf_write = [_]u8{0} ** 1024;
+    var write_index: usize = 0;
+    const INVALID_INDEX = std.math.maxInt(u32);
+    const device = params.sink_name;
+    const corked = true;
+    const volume_set = false; // volume != null;
+    const version = PulseAudio.version;
+
+    try PulseAudio.putHeader(&write_index, &buf_write, .{});
+    try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CreatePlaybackStream, pa.get_next_seq());
+    try tagstruct.putSampleSpec(&write_index, &buf_write, params.sample_spec);
+    try tagstruct.putChannelMap(&write_index, &buf_write, params.channel_map);
+    try tagstruct.putU32(&write_index, &buf_write, INVALID_INDEX);
+    try tagstruct.putString(&write_index, &buf_write, device);
+    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.max_length);
+    try tagstruct.putBoolean(&write_index, &buf_write, corked);
+
+    // Playback specific
+    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.target_length);
+    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.pre_buffering);
+    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.minimum_request_length);
+    try tagstruct.putU32(&write_index, &buf_write, params.sync_id);
+
+    try tagstruct.putCVolume(&write_index, &buf_write, params.cvolume);
+
+    if (version >= 12) {
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remap_channels); // no remap channels
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remix_channels); // no remix channels
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_format); // fix format
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_rate); // fix rate
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_channels); // fix channels
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_move); // dont move
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.variable_rate); // variable rate
+    }
+
+    if (version >= 13) {
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted); // start muted
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.adjust_latency); // adjust latency
+        try tagstruct.putPropList(&write_index, &buf_write, params.props);
+    }
+
+    if (version >= 14) {
+        // if (direction == .Playback)
+        try tagstruct.putBoolean(&write_index, &buf_write, volume_set); // volume set
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.early_requests); // early stream requests
+    }
+
+    if (version >= 15) {
+        // if (direction == .Playback)
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted or params.flags.start_unmuted);
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_inhibit_auto_suspend);
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fail_on_suspend);
+    }
+    if (version >= 17) {
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
+    }
+    if (version >= 18) {
+        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.stream_passthrough);
+    }
+    // if ((version >= 21 and stream.direction == .Playback) or version >= 22) {
+    const req_formats = [_]tagstruct.FormatInfo{};
+    try tagstruct.putU8(&write_index, &buf_write, req_formats.len);
+    for (req_formats) |format| {
+        try tagstruct.putFormatInfo(&write_index, &buf_write, format);
+    }
+    // }
+    // if (version >= 22 and stream.direction == .Record) {
+    //     try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
+    // }
+
+    // TODO: wow, that is a lot of fields to send
+
+    PulseAudio.write_finish(&buf_write, write_index);
+
+    std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
+
+    try pa.socket.?.writeAll(buf_write[0..write_index]);
+
+    const count = try pa.socket.?.read(&pa.buf_read);
+
+    const read_from = pa.buf_read[0..count];
+
+    std.log.debug("New Stream reply: {}", .{std.fmt.fmtSliceHexUpper(read_from)});
+
+    var index: usize = 0;
+    const header = try PulseAudio.read_pa_header(&index, read_from);
+    std.debug.assert(header.channel == std.math.maxInt(u32));
+
+    const command = try PulseAudio.readCommand(&index, read_from);
+    if (command != .Reply) return error.UnexpectedCommand;
+
+    // const seq_int = try tagstruct.getNextValue(&index, read_from) orelse return error.EndOfStream;
+    // std.debug.assert(seq_int.Uint32 == 0);
+
+    // const version_srv_var = try tagstruct.getNextValue(&index, read_from) orelse return error.EndOfStream;
+    // if (version_srv_var != .Uint32) return error.UnexpectedValue;
+
+    // const version_srv = version_srv_var.Uint32;
+    // if (version_srv & version_mask < version) {
+    //     std.log.debug("server version: {}", .{version_srv});
+    //     return error.OutdatedServer;
+    // }
+
     while (true) {}
 }
 
-// fn state_callback(pa: *PulseAudio, userdata: *anyopaque) void {
-//     _ = userdata;
-//     const state = pa.get_context_state();
-//     switch (state) {
-//         .Unconnected,
-//         .Connecting,
-//         .Authorizing,
-//         .SettingName,
-//         => {},
-//         .Failed,
-//         .Terminated,
-//         => {},
-//         .Ready,
-//         => {},
-//     }
-// }
+// fn stream_request_cb(stream: *anyopaque) callconv(.C) void {}
 
 const PulseAudio = struct {
     seq: u32 = 0,
@@ -89,9 +211,14 @@ const PulseAudio = struct {
 
         var write_index: usize = 0;
 
+        const auth_params = AuthParams{
+            .version = version,
+            .supports_shm = true,
+        };
+
         try putHeader(&write_index, &pa.buf_write, .{});
         try putCommand(&write_index, &pa.buf_write, Command.Tag.Auth, pa.get_next_seq());
-        try tagstruct.putU32(&write_index, &pa.buf_write, version);
+        try tagstruct.putU32(&write_index, &pa.buf_write, @bitCast(auth_params));
         try tagstruct.putArbitrary(&write_index, &pa.buf_write, cookie);
         write_finish(&pa.buf_write, write_index);
 
@@ -139,7 +266,7 @@ const PulseAudio = struct {
         try tagstruct.putPropList(&write_index, &pa.buf_write, list);
         write_finish(&pa.buf_write, write_index);
 
-        std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(pa.buf_write[0..write_index])});
+        std.log.debug("SetClientName: {}", .{std.fmt.fmtSliceHexUpper(pa.buf_write[0..write_index])});
 
         try pa.socket.?.writeAll(pa.buf_write[0..write_index]);
 
@@ -163,6 +290,115 @@ const PulseAudio = struct {
 
         pa.client_index = try tagstruct.getU32(&index, read_from);
     }
+
+    const Stream = struct {
+        const Flags = packed struct(u32) {
+            start_corked: bool = false,
+            interpolate_timing: bool = false,
+            not_monotonic: bool = false,
+            auto_timing_update: bool = false,
+            no_remap_channels: bool = false,
+            no_remix_channels: bool = false,
+            fix_format: bool = false,
+            fix_rate: bool = false,
+            fix_channels: bool = false,
+            dont_move: bool = false,
+            variable_rate: bool = false,
+            peak_detect: bool = false,
+            start_muted: bool = false,
+            adjust_latency: bool = false,
+            early_requests: bool = false,
+            dont_inhibit_auto_suspend: bool = false,
+            start_unmuted: bool = false,
+            fail_on_suspend: bool = false,
+            relative_volume: bool = false,
+            stream_passthrough: bool = false,
+            _unused: u12 = 0,
+        };
+        const Direction = enum {
+            NoDirection,
+            Playback,
+            Record,
+            Upload,
+        };
+    };
+
+    // pub fn stream_new(pa: *PulseAudio, params: PlaybackStreamParams) Stream {
+    //     var write_index: usize = 0;
+    //     const INVALID_INDEX = std.math.maxInt(u32);
+    //     const device = params.sink_name; // TODO IDK, something like this
+    //     const corked = true;
+    //     const volume_set = volume != null;
+
+    //     try putHeader(&write_index, &pa.buf_write, .{});
+    //     try putCommand(&write_index, &pa.buf_write, Command.Tag.CreatePlaybackStream, pa.get_next_seq());
+    //     try tagstruct.putSampleSpec(&write_index, &pa.buf_write, params.sample_spec);
+    //     try tagstruct.putChannelMap(&write_index, &pa.buf_write, params.channel_map);
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, INVALID_INDEX);
+    //     try tagstruct.putString(&write_index, &pa.buf_write, device);
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, params.buffer_attr.max_length);
+    //     try tagstruct.putBoolean(&write_index, &pa.buf_write, corked);
+
+    //     // Playback specific
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, params.buffer_attr.target_length);
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, params.buffer_attr.pre_buffering);
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, params.buffer_attr.minimum_request_length);
+    //     try tagstruct.putU32(&write_index, &pa.buf_write, params.sync_id);
+
+    //     try tagstruct.putCVolume(&write_index, &pa.buf_write, params.cvolume);
+
+    //     if (version >= 12) {
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.no_remap_channels); // no remap channels
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.no_remix_channels); // no remix channels
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.fix_format); // fix format
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.fix_rate); // fix rate
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.fix_channels); // fix channels
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.dont_move); // dont move
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.variable_rate); // variable rate
+    //     }
+
+    //     if (version >= 13) {
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.start_muted); // start muted
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.adjust_latency); // adjust latency
+    //         try tagstruct.putPropList(&write_index, &pa.buf_write, params.props);
+    //     }
+
+    //     if (version >= 14) {
+    //         // if (direction == .Playback)
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, volume_set); // volume set
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.early_requests); // early stream requests
+    //     }
+
+    //     if (version >= 15) {
+    //         // if (direction == .Playback)
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.muted or parms.flags.unmuted);
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.dont_inhibit_auto_suspend);
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.fail_on_suspend);
+    //     }
+    //     if (version >= 17) {
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.relative_volume);
+    //     }
+    //     if (version >= 18) {
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.stream_passthrough);
+    //     }
+    //     if ((version >= 21 and stream.direction == .Playback) or version >= 22) {
+    //         try tagstruct.putU8(&write_index, &pa.buf_write, stream.req_formats.len);
+    //         for (stream.req_formats) |format| {
+    //             try tagstruct.putFormatInfo(&write_index, &pa.buf_write, format);
+    //         }
+    //     }
+    //     if (version >= 22 and stream.direction == .Record) {
+    //         try tagstruct.putBoolean(&write_index, &pa.buf_write, params.flags.relative_volume);
+    //     }
+
+    //     // TODO: wow, that is a lot of fields to send
+
+    //     write_finish(&pa.buf_write, write_index);
+
+    //     std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(pa.buf_write[0..write_index])});
+
+    //     return .{};
+    // }
 
     /// Returns a slice containing the pulseaudio authentication cookie.
     /// Must be freed with the same allocator passed to function.
@@ -262,55 +498,14 @@ const PulseAudio = struct {
     const version_mask = 0x0000_FFFF;
     const AuthParams = packed struct(u32) {
         /// Clients protocol version
-        version: u16,
-        _unused: u14,
+        version: u16 = version,
+        _unused: u14 = 0,
         /// If the client supports memfd blocks
-        supports_memfd: bool,
+        supports_memfd: bool = false,
         /// If the client supports shared memory blocks
-        supports_shm: bool,
+        supports_shm: bool = false,
     };
 
-    const SampleSpec = struct {
-        format: Format,
-        channels: u8,
-        sample_rate: u32,
-
-        const Format = enum(u8) {
-            Invalid = std.math.maxInt(u8),
-            Uint8 = 0,
-            Alaw = 1,
-            Ulaw = 2,
-            Sint16Le = 3,
-            Sint16Be = 4,
-            Float32Le = 5,
-            Float32Be = 6,
-            Sint32Le = 7,
-            Sint32Be = 8,
-            Sint24Le = 9,
-            Sint24Be = 10,
-            Sint24in32Le = 11,
-            Sint24in32Be = 12,
-        };
-    };
-    const MAX_CHANNELS = 32;
-    const ChannelMap = struct {
-        channels: u8,
-        map: [MAX_CHANNELS]Position,
-        const Position = enum {};
-    };
-    const Volume = enum(u32) { _ };
-    const ChannelVolume = struct {
-        channels: u8,
-        volumes: [MAX_CHANNELS]Volume,
-    };
-    const FormatEncoding = enum {};
-    const FormatInfo = struct {
-        encoding: FormatEncoding,
-        props: PropertyList,
-    };
-    const StreamFlags = packed struct(u16) {
-        _unused: u32,
-    };
     const BufferAttr = struct {
         max_length: u32,
         target_length: u32,
@@ -320,16 +515,16 @@ const PulseAudio = struct {
     };
 
     const PlaybackStreamParams = struct {
-        sample_spec: SampleSpec,
-        channel_map: ChannelMap,
+        sample_spec: tagstruct.SampleSpec,
+        channel_map: tagstruct.ChannelMap,
         sink_index: ?u32,
-        sink_name: ?[]const u8 = null,
+        sink_name: ?[:0]const u8 = null,
         buffer_attr: BufferAttr,
         sync_id: u32,
-        cvolume: ?ChannelVolume,
-        props: PropertyList,
-        formats: []const FormatInfo,
-        flags: StreamFlags,
+        cvolume: tagstruct.CVolume,
+        props: tagstruct.PropList,
+        formats: []const tagstruct.FormatInfo,
+        flags: Stream.Flags,
     };
 
     const ErrorCode = enum(u32) {

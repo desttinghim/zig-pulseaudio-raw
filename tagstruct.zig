@@ -21,17 +21,16 @@
 // allocated or heap-allocated buffer, but they are responsible for the lifetime
 // of the buffer.
 
-pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
+pub fn putString(index: *usize, buffer: []u8, str_opt: ?[:0]const u8) Error!void {
     if (buffer.len -| index.* < 1) return error.OutOfSpace;
     const write_to = buffer[index.*..];
     if (str_opt) |str| {
-        const need_to_add_null = str[str.len - 1] != 0;
-        const length = if (need_to_add_null) str.len + 2 else str.len + 1;
+        const length = str.len + 1;
         if (write_to.len < length) return error.OutOfSpace;
         write_to[0] = @intFromEnum(Tag.String);
         @memcpy(write_to[1..][0..str.len], str);
-        if (length > str.len) write_to[length - 1] = 0;
-        index.* += length;
+        write_to[1..][str.len] = 0;
+        index.* += 1 + str.len + 1; // Tag + Null-terminated String
     } else {
         write_to[0] = @intFromEnum(Tag.StringNull);
         index.* += 1;
@@ -39,7 +38,7 @@ pub fn putString(index: *usize, buffer: []u8, str_opt: ?[]const u8) Error!void {
 }
 
 test putString {
-    var buffer = [_]u8{0} ** 128;
+    var buffer = [_]u8{0xAA} ** 128;
     var index: usize = 0;
 
     try putString(&index, &buffer, "application.name");
@@ -59,7 +58,7 @@ pub fn putU32(index: *usize, buffer: []u8, value: u32) Error!void {
 }
 
 test putU32 {
-    var buffer = [_]u8{0} ** 16;
+    var buffer = [_]u8{0xAA} ** 16;
     var index: usize = 0;
     try putU32(&index, &buffer, 0xDEADBEEF);
     const expected = [_]u8{ @intFromEnum(Tag.Uint32), 0xDE, 0xAD, 0xBE, 0xEF };
@@ -75,7 +74,7 @@ pub fn putU8(index: *usize, buffer: []u8, value: u8) Error!void {
 }
 
 test putU8 {
-    var buffer = [_]u8{0} ** 16;
+    var buffer = [_]u8{0xAA} ** 16;
     var index: usize = 0;
     try putU8(&index, &buffer, 69);
     const expected = [_]u8{ @intFromEnum(Tag.Uint8), 69 };
@@ -93,7 +92,7 @@ pub fn putSampleSpec(index: *usize, buffer: []u8, sample_spec: SampleSpec) Error
 }
 
 test putSampleSpec {
-    var buffer = [_]u8{0} ** 16;
+    var buffer = [_]u8{0xAA} ** 16;
     var index: usize = 0;
     try putSampleSpec(&index, &buffer, SampleSpec{
         .format = SampleSpec.Format.Uint8,
@@ -123,12 +122,13 @@ pub fn putArbitrary(index: *usize, buffer: []u8, bytes: []const u8) !void {
 
 pub fn putArbitraryWithNull(index: *usize, buffer: []u8, bytes: []const u8) !void {
     if (buffer.len -| index.* < 5 + bytes.len + 1) return error.OutOfSpace;
+    const length = bytes.len + 1;
     const write_to = buffer[index.*..];
     write_to[0] = @intFromEnum(Tag.Arbitrary);
-    std.mem.writeInt(u32, write_to[1..5], @intCast(bytes.len + 1), .big);
+    std.mem.writeInt(u32, write_to[1..5], @intCast(length), .big);
     @memcpy(write_to[5..][0..bytes.len], bytes);
-    write_to[5 + bytes.len + 1] = 0;
-    index.* += 5 + bytes.len + 1;
+    write_to[5..][bytes.len] = 0;
+    index.* += 5 + length;
 }
 
 pub fn putBoolean(index: *usize, buffer: []u8, value: bool) !void {
@@ -215,7 +215,7 @@ pub fn putPropList(index: *usize, buffer: []u8, prop_list: PropList) !void {
         // TODO: decide whether to allow or disallow nulls
         total_length += 1 + item[0].len + 1; // Tag + Length + Null
         total_length += 1 + @sizeOf(u32); // Tag + U32
-        total_length += 1 + @sizeOf(u32) + item[1].len; // Tag + U32 + Length
+        total_length += 1 + @sizeOf(u32) + item[1].len + 1; // Tag + U32 + Length + Null
     }
     total_length += 1; // StringNull Tag
     if (buffer.len -| index.* < total_length) return error.OutOfSpace;
@@ -228,6 +228,27 @@ pub fn putPropList(index: *usize, buffer: []u8, prop_list: PropList) !void {
         try putArbitraryWithNull(index, buffer, item[1]);
     }
     try putString(index, buffer, null);
+}
+
+test putPropList {
+    var buffer = [_]u8{0xAA} ** 128;
+    var index: usize = 0;
+
+    var list = [_]Prop{
+        .{ Property.MediaRole.to_string(), "game" },
+        .{ Property.ApplicationName.to_string(), "tagstruct" },
+        .{ Property.ApplicationLanguage.to_string(), "en_US.UTF8" },
+    };
+
+    try putPropList(&index, &buffer, &list);
+
+    const expected =
+        "P" ++
+        "tmedia.role\x00L\x00\x00\x00\x05x\x00\x00\x00\x05game\x00" ++
+        "tapplication.name\x00L\x00\x00\x00\x0ax\x00\x00\x00\x0atagstruct\x00" ++
+        "tapplication.language\x00L\x00\x00\x00\x0bx\x00\x00\x00\x0ben_US.UTF8\x00" ++
+        "N";
+    try std.testing.expectEqualSlices(u8, expected, buffer[0..index]);
 }
 
 pub fn putFormatInfo(index: *usize, buffer: []u8, info: FormatInfo) !void {
@@ -261,40 +282,15 @@ test putFormatInfo {
         },
     };
     try putFormatInfo(&index, &buffer, f_info);
-    const expected = [_]u8{
-        @intFromEnum(Tag.FormatInfo),
-        @intFromEnum(FormatEncoding.Any),
-        @intFromEnum(Tag.PropList),
-        @intFromEnum(Tag.String),
-    } ++ comptime Property.FormatSampleFormat.to_string() ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 6, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 6, // Length again
-    } ++ "float" ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.String),
-    } ++ Property.FormatRate.to_string() ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 6, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 6, // Length again
-    } ++ "44100" ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.String),
-    } ++ Property.FormatChannels.to_string() ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 2, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 2, // Length again
-    } ++ "2" ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.String),
-    } ++ Property.FormatChannelMap.to_string() ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.Uint32), 0, 0, 0, 7, // Length
-        @intFromEnum(Tag.Arbitrary), 0, 0, 0, 7, // Length again
-    } ++ "stereo" ++ .{
-        0, // null terminator
-        @intFromEnum(Tag.StringNull),
-    };
+
+    const expected =
+        "f\x00P" ++
+        "tformat.sample_format\x00L\x00\x00\x00\x06x\x00\x00\x00\x06float\x00" ++
+        "tformat.rate\x00L\x00\x00\x00\x06x\x00\x00\x00\x0644100\x00" ++
+        "tformat.channels\x00L\x00\x00\x00\x02x\x00\x00\x00\x022\x00" ++
+        "tformat.channel_map\x00L\x00\x00\x00\x07x\x00\x00\x00\x07stereo\x00" ++
+        "N";
+
     try std.testing.expectEqualSlices(u8, expected[0..], buffer[0..index]);
 }
 
@@ -357,7 +353,7 @@ pub fn getNextValue(index: *usize, buffer: []const u8) Error!?Value {
 }
 
 test getNextValue {
-    var buffer = [_]u8{0} ** 256;
+    var buffer = [_]u8{0xAA} ** 256;
     var write_index: usize = 0;
 
     try putString(&write_index, &buffer, "spaghetti");
@@ -370,7 +366,7 @@ test getNextValue {
         .sample_rate = 44100,
     });
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{@intFromEnum(Tag.String)} ++ "spaghetti" ++ [_]u8{0}, buffer[0..11]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{@intFromEnum(Tag.String)} ++ "spaghetti\x00", buffer[0..11]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xCA, 0xFE, 0xBA, 0xBE }, buffer[11..16]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Uint32), 0xDE, 0xAD, 0xBE, 0xEF }, buffer[16..21]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ @intFromEnum(Tag.Arbitrary), 0, 0, 0, 4, 69, 42, 0xAB, 0xCD }, buffer[21..30]);
@@ -558,7 +554,7 @@ pub fn getChannelMap(index: *usize, buffer: []const u8) Error!ChannelMap {
 }
 
 test getChannelMap {
-    var buffer = [_]u8{0} ** 256;
+    var buffer = [_]u8{0xAA} ** 256;
     var write_index: usize = 0;
 
     var channel_map_original = ChannelMap{
@@ -599,7 +595,7 @@ pub fn getCVolume(index: *usize, buffer: []const u8) Error!CVolume {
 }
 
 test getCVolume {
-    var buffer = [_]u8{0} ** 256;
+    var buffer = [_]u8{0xAA} ** 256;
     var write_index: usize = 0;
 
     var cvolume_original = CVolume{
@@ -631,7 +627,7 @@ pub fn getVolume(index: *usize, buffer: []const u8) Error!Volume {
 }
 
 test getVolume {
-    var buffer = [_]u8{0} ** 256;
+    var buffer = [_]u8{0xAA} ** 256;
     var write_index: usize = 0;
 
     try putVolume(&write_index, &buffer, Volume.Normal);
@@ -755,7 +751,7 @@ pub const MAX_CHANNELS = 32;
 pub const ChannelMap = struct {
     channels: u8,
     map: [MAX_CHANNELS]Position = [_]Position{.Mono} ** MAX_CHANNELS,
-    const Position = enum(u8) {
+    pub const Position = enum(u8) {
         Mono = 0,
 
         FrontLeft,
@@ -883,7 +879,7 @@ pub const CVolume = struct {
         return true;
     }
 };
-pub const Prop = struct { []const u8, []const u8 };
+pub const Prop = struct { [:0]const u8, [:0]const u8 };
 pub const PropList = []const Prop;
 pub const FormatEncoding = enum {
     Any,
@@ -924,11 +920,6 @@ pub const Tag = enum(u8) {
     Volume = 'V',
     FormatInfo = 'f',
 };
-
-const ParseError = error{
-    TypeMismatch,
-    StringNull,
-} || std.io.AnyReader.Error;
 
 // --- Includes and Constants -------------------------------------------------
 const max_tag_size = (64 * 1024);
