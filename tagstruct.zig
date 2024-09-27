@@ -548,7 +548,7 @@ pub fn getChannelMap(index: *usize, buffer: []const u8) Error!ChannelMap {
         channel_map.map[i] = @enumFromInt(position);
     }
 
-    index.* += 2 + channel_map.channels * 4; // Only advance index if no error occurs
+    index.* += 2 + channel_map.channels; // Only advance index if no error occurs
 
     return channel_map;
 }
@@ -819,7 +819,23 @@ pub const ChannelMap = struct {
         _ = str;
         @panic("unimplemented");
     }
+
+    pub fn format(channel_map: ChannelMap, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = options;
+        if (fmt.len != 0) std.fmt.invalidFmtError(fmt, channel_map);
+        try std.fmt.format(
+            writer,
+            "ChannelMap{{ .channels = {}, .map = {{ ",
+            .{channel_map.channels},
+        );
+        for (channel_map.map[0..channel_map.channels], 0..) |channel, i| {
+            if (i != 0) try writer.writeAll(", ");
+            try std.fmt.format(writer, ".{s}", .{@tagName(channel)});
+        }
+        try std.fmt.format(writer, " }} }}", .{});
+    }
 };
+
 pub const Volume = enum(u32) {
     /// Minimal valid volume (0%, -inf dB)
     Muted = 0,
@@ -866,10 +882,52 @@ pub const Volume = enum(u32) {
         const max = @intFromEnum(Volume.Max);
         return @enumFromInt(@max(muted, @min(vol, max)));
     }
+
+    pub fn format(volume: Volume, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = options;
+        if (fmt.len != 0) std.fmt.invalidFmtError(fmt, volume);
+        const desc_opt = switch (volume) {
+            .Muted => "Muted",
+            .Normal => "Normal",
+            .Max => "Max",
+            .MaxUI => "Max UI",
+            .Invalid => "Invalid",
+            _ => null,
+        };
+        const volume_int = @intFromEnum(volume);
+        if (desc_opt) |desc| {
+            try std.fmt.format(
+                writer,
+                "{} ({s})",
+                .{ volume_int, desc },
+            );
+        } else {
+            try std.fmt.format(
+                writer,
+                "{}",
+                .{volume_int},
+            );
+        }
+    }
 };
 pub const CVolume = struct {
     channels: u8,
     volumes: [MAX_CHANNELS]Volume = [_]Volume{@enumFromInt(0)} ** MAX_CHANNELS,
+
+    pub fn format(cvolume: CVolume, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = options;
+        if (fmt.len != 0) std.fmt.invalidFmtError(fmt, cvolume);
+        try std.fmt.format(
+            writer,
+            "CVolume{{ .channels = {}, .volumes = {{ ",
+            .{cvolume.channels},
+        );
+        for (cvolume.volumes[0..cvolume.channels], 0..) |volume, i| {
+            if (i != 0) try writer.writeAll(", ");
+            try std.fmt.format(writer, ".{}", .{volume});
+        }
+        try std.fmt.format(writer, " }} }}", .{});
+    }
 
     pub fn eq(lhs: CVolume, rhs: CVolume) bool {
         if (lhs.channels != rhs.channels) return false;

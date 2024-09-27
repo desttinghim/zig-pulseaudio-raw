@@ -74,9 +74,13 @@ pub fn main() !void {
     const corked = true;
     const volume_set = false; // volume != null;
     const version = PulseAudio.version;
+    const new_stream_seq = pa.get_next_seq();
+    const is_playback = true;
+    const is_recording = false;
+    const is_not_upload = true;
 
     try PulseAudio.putHeader(&write_index, &buf_write, .{});
-    try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CreatePlaybackStream, pa.get_next_seq());
+    try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CreatePlaybackStream, new_stream_seq);
     try tagstruct.putSampleSpec(&write_index, &buf_write, params.sample_spec);
     try tagstruct.putChannelMap(&write_index, &buf_write, params.channel_map);
     try tagstruct.putU32(&write_index, &buf_write, INVALID_INDEX);
@@ -158,17 +162,84 @@ pub fn main() !void {
     const command = try PulseAudio.readCommand(&index, read_from);
     if (command != .Reply) return error.UnexpectedCommand;
 
-    // const seq_int = try tagstruct.getNextValue(&index, read_from) orelse return error.EndOfStream;
-    // std.debug.assert(seq_int.Uint32 == 0);
+    const seq_int = try tagstruct.getU32(&index, read_from);
+    std.debug.assert(seq_int == new_stream_seq);
 
-    // const version_srv_var = try tagstruct.getNextValue(&index, read_from) orelse return error.EndOfStream;
-    // if (version_srv_var != .Uint32) return error.UnexpectedValue;
+    const channel_var = try tagstruct.getU32(&index, read_from);
+    if (channel_var == std.math.maxInt(u32)) return error.ProtocolError;
 
-    // const version_srv = version_srv_var.Uint32;
-    // if (version_srv & version_mask < version) {
-    //     std.log.debug("server version: {}", .{version_srv});
-    //     return error.OutdatedServer;
-    // }
+    var stream_index: u32 = 0;
+    var requested_bytes: u32 = 0;
+
+    if (is_not_upload)
+        stream_index = try tagstruct.getU32(&index, read_from);
+
+    if (!is_recording)
+        requested_bytes = try tagstruct.getU32(&index, read_from);
+
+    var buffer_attr = PulseAudio.BufferAttr{};
+    if (version >= 9) {
+        if (is_playback) {
+            buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
+            buffer_attr.target_length = try tagstruct.getU32(&index, read_from);
+            buffer_attr.pre_buffering = try tagstruct.getU32(&index, read_from);
+            buffer_attr.minimum_request_length = try tagstruct.getU32(&index, read_from);
+        } else if (is_recording) {
+            buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
+            buffer_attr.fragment_size = try tagstruct.getU32(&index, read_from);
+        }
+    }
+
+    std.log.debug(
+        \\
+        \\ command {}
+        \\ seq {}
+        \\ channel {}
+        \\ stream index {}
+        \\ requested bytes {}
+        \\ buffer attr {}
+        \\
+    , .{ command, seq_int, channel_var, stream_index, requested_bytes, buffer_attr });
+
+    if (version >= 12 and is_not_upload) {
+        const sample_spec = try tagstruct.getSampleSpec(&index, read_from);
+        const channel_map = try tagstruct.getChannelMap(&index, read_from);
+        const device_index = tagstruct.getU32(&index, read_from) //;
+        catch |e| switch (e) {
+            error.TypeMismatch => {
+                std.log.err("Expected '{x}', got 0x{x} at index 0x{x}", .{ 'L', read_from[index], index });
+                return e;
+            },
+            else => return e,
+        };
+        const device_name = try tagstruct.getString(&index, read_from) orelse "Unknown";
+        const suspended = try tagstruct.getBool(&index, read_from);
+        std.log.debug(
+            \\
+            \\ sample spec {}
+            \\ channel map {}
+            \\ device index {}
+            \\ device name {s}
+            \\ suspended {}
+            \\
+        , .{ sample_spec, channel_map, device_index, device_name, suspended });
+    }
+
+    if (version >= 13 and is_not_upload) {
+        const usec = try tagstruct.getUsec(&index, read_from);
+        std.log.debug(
+            \\ 
+            \\ usec {}
+        , .{usec});
+    }
+
+    if (version >= 21 and is_playback or version >= 22) {
+        const format_info = try tagstruct.getFormatInfo(&index, read_from);
+        std.log.debug(
+            \\ 
+            \\ format info {}
+        , .{format_info});
+    }
 
     while (true) {}
 }
@@ -507,11 +578,11 @@ const PulseAudio = struct {
     };
 
     const BufferAttr = struct {
-        max_length: u32,
-        target_length: u32,
-        pre_buffering: u32,
-        minimum_request_length: u32,
-        fragment_size: u32,
+        max_length: u32 = 0,
+        target_length: u32 = 0,
+        pre_buffering: u32 = 0,
+        minimum_request_length: u32 = 0,
+        fragment_size: u32 = 0,
     };
 
     const PlaybackStreamParams = struct {
