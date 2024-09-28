@@ -149,99 +149,115 @@ pub fn main() !void {
 
     try pa.socket.?.writeAll(buf_write[0..write_index]);
 
-    const count = try pa.socket.?.read(&pa.buf_read);
+    // Read reply
+    {
+        const count = try pa.socket.?.read(&pa.buf_read);
 
-    const read_from = pa.buf_read[0..count];
+        const read_from = pa.buf_read[0..count];
 
-    std.log.debug("New Stream reply: {}", .{std.fmt.fmtSliceHexUpper(read_from)});
+        std.log.debug("New Stream reply: {}", .{std.fmt.fmtSliceHexUpper(read_from)});
 
-    var index: usize = 0;
-    const header = try PulseAudio.read_pa_header(&index, read_from);
-    std.debug.assert(header.channel == std.math.maxInt(u32));
+        var index: usize = 0;
+        const header = try PulseAudio.read_pa_header(&index, read_from);
+        std.debug.assert(header.channel == std.math.maxInt(u32));
 
-    const command = try PulseAudio.readCommand(&index, read_from);
-    if (command != .Reply) return error.UnexpectedCommand;
+        const command = try PulseAudio.readCommand(&index, read_from);
+        if (command != .Reply) return error.UnexpectedCommand;
 
-    const seq_int = try tagstruct.getU32(&index, read_from);
-    std.debug.assert(seq_int == new_stream_seq);
+        const seq_int = try tagstruct.getU32(&index, read_from);
+        std.debug.assert(seq_int == new_stream_seq);
 
-    const channel_var = try tagstruct.getU32(&index, read_from);
-    if (channel_var == std.math.maxInt(u32)) return error.ProtocolError;
+        const channel_var = try tagstruct.getU32(&index, read_from);
+        if (channel_var == std.math.maxInt(u32)) return error.ProtocolError;
 
-    var stream_index: u32 = 0;
-    var requested_bytes: u32 = 0;
+        var stream_index: u32 = 0;
+        var requested_bytes: u32 = 0;
 
-    if (is_not_upload)
-        stream_index = try tagstruct.getU32(&index, read_from);
+        if (is_not_upload)
+            stream_index = try tagstruct.getU32(&index, read_from);
 
-    if (!is_recording)
-        requested_bytes = try tagstruct.getU32(&index, read_from);
+        if (!is_recording)
+            requested_bytes = try tagstruct.getU32(&index, read_from);
 
-    var buffer_attr = PulseAudio.BufferAttr{};
-    if (version >= 9) {
-        if (is_playback) {
-            buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
-            buffer_attr.target_length = try tagstruct.getU32(&index, read_from);
-            buffer_attr.pre_buffering = try tagstruct.getU32(&index, read_from);
-            buffer_attr.minimum_request_length = try tagstruct.getU32(&index, read_from);
-        } else if (is_recording) {
-            buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
-            buffer_attr.fragment_size = try tagstruct.getU32(&index, read_from);
+        var buffer_attr = PulseAudio.BufferAttr{};
+        if (version >= 9) {
+            if (is_playback) {
+                buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
+                buffer_attr.target_length = try tagstruct.getU32(&index, read_from);
+                buffer_attr.pre_buffering = try tagstruct.getU32(&index, read_from);
+                buffer_attr.minimum_request_length = try tagstruct.getU32(&index, read_from);
+            } else if (is_recording) {
+                buffer_attr.max_length = try tagstruct.getU32(&index, read_from);
+                buffer_attr.fragment_size = try tagstruct.getU32(&index, read_from);
+            }
+        }
+
+        std.log.debug(
+            \\
+            \\ command {}
+            \\ seq {}
+            \\ channel {}
+            \\ stream index {}
+            \\ requested bytes {}
+            \\ buffer attr {}
+            \\
+        , .{ command, seq_int, channel_var, stream_index, requested_bytes, buffer_attr });
+
+        if (version >= 12 and is_not_upload) {
+            const sample_spec = try tagstruct.getSampleSpec(&index, read_from);
+            const channel_map = try tagstruct.getChannelMap(&index, read_from);
+            const device_index = tagstruct.getU32(&index, read_from) //;
+            catch |e| switch (e) {
+                error.TypeMismatch => {
+                    std.log.err("Expected '{x}', got 0x{x} at index 0x{x}", .{ 'L', read_from[index], index });
+                    return e;
+                },
+                else => return e,
+            };
+            const device_name = try tagstruct.getString(&index, read_from) orelse "Unknown";
+            const suspended = try tagstruct.getBool(&index, read_from);
+            std.log.debug(
+                \\
+                \\ sample spec {}
+                \\ channel map {}
+                \\ device index {}
+                \\ device name {s}
+                \\ suspended {}
+                \\
+            , .{ sample_spec, channel_map, device_index, device_name, suspended });
+        }
+
+        if (version >= 13 and is_not_upload) {
+            const usec = try tagstruct.getUsec(&index, read_from);
+            std.log.debug(
+                \\ 
+                \\ usec {}
+            , .{usec});
+        }
+
+        if (version >= 21 and is_playback or version >= 22) {
+            // const format_info = try tagstruct.getFormatInfo(&index, read_from);
+            // std.log.debug(
+            //     \\
+            //     \\ format info {}
+            // , .{format_info});
         }
     }
 
-    std.log.debug(
-        \\
-        \\ command {}
-        \\ seq {}
-        \\ channel {}
-        \\ stream index {}
-        \\ requested bytes {}
-        \\ buffer attr {}
-        \\
-    , .{ command, seq_int, channel_var, stream_index, requested_bytes, buffer_attr });
+    while (true) {
+        const count = try pa.socket.?.read(&pa.buf_read);
 
-    if (version >= 12 and is_not_upload) {
-        const sample_spec = try tagstruct.getSampleSpec(&index, read_from);
-        const channel_map = try tagstruct.getChannelMap(&index, read_from);
-        const device_index = tagstruct.getU32(&index, read_from) //;
-        catch |e| switch (e) {
-            error.TypeMismatch => {
-                std.log.err("Expected '{x}', got 0x{x} at index 0x{x}", .{ 'L', read_from[index], index });
-                return e;
-            },
-            else => return e,
-        };
-        const device_name = try tagstruct.getString(&index, read_from) orelse "Unknown";
-        const suspended = try tagstruct.getBool(&index, read_from);
-        std.log.debug(
-            \\
-            \\ sample spec {}
-            \\ channel map {}
-            \\ device index {}
-            \\ device name {s}
-            \\ suspended {}
-            \\
-        , .{ sample_spec, channel_map, device_index, device_name, suspended });
+        const read_from = pa.buf_read[0..count];
+
+        var index: usize = 0;
+        const header = try PulseAudio.read_pa_header(&index, read_from);
+        std.debug.assert(header.channel == std.math.maxInt(u32));
+
+        const command = try PulseAudio.readCommand(&index, read_from);
+        const seq_int = try tagstruct.getU32(&index, read_from);
+
+        std.log.debug("New Stream reply: {} {} {}", .{ command, seq_int, std.fmt.fmtSliceHexUpper(read_from) });
     }
-
-    if (version >= 13 and is_not_upload) {
-        const usec = try tagstruct.getUsec(&index, read_from);
-        std.log.debug(
-            \\ 
-            \\ usec {}
-        , .{usec});
-    }
-
-    if (version >= 21 and is_playback or version >= 22) {
-        const format_info = try tagstruct.getFormatInfo(&index, read_from);
-        std.log.debug(
-            \\ 
-            \\ format info {}
-        , .{format_info});
-    }
-
-    while (true) {}
 }
 
 // fn stream_request_cb(stream: *anyopaque) callconv(.C) void {}
@@ -284,7 +300,7 @@ const PulseAudio = struct {
 
         const auth_params = AuthParams{
             .version = version,
-            .supports_shm = true,
+            .supports_shm = false,
         };
 
         try putHeader(&write_index, &pa.buf_write, .{});
@@ -683,6 +699,134 @@ const PulseAudio = struct {
             Exit = 7,
             Auth = 8,
             SetClientName = 9,
+            LookupSink = 10,
+            LookupSource = 11,
+            DrainPlaybackStream = 12,
+            Stat = 13,
+            GetPlaybackLatency = 14,
+            CreateUploadStream = 15,
+            DeleteUploadStream = 16,
+            FinishUploadStream = 17,
+            PlaySample = 18,
+            RemoveSample = 19,
+
+            GetServerInfo,
+            GetSinkInfo,
+            GetSinkInfoList,
+            GetSourceInfo,
+            GetSourceInfoList,
+            GetModuleInfo,
+            GetModuleInfoList,
+            GetClientInfo,
+            GetClientInfoList,
+            GetSinkInputInfo,
+            GetSinkInputInfoList,
+            GetSourceOutputInfo,
+            GetSourceOutputInfoList,
+            GetSampleInfo,
+            GetSampleInfoList,
+            Subscribe,
+
+            SetSinkVolume,
+            SetSinkInputVolume,
+            SetSourceVolume,
+
+            SetSinkMute,
+            SetSourceMute,
+
+            CorkPlaybackStream,
+            FlushPlaybackStream,
+            TriggerPlaybackStream,
+
+            SetDefaultSink,
+            SetDefaultSource,
+
+            SetPlaybackStreamName,
+            SetRecordStreamName,
+
+            KillClient,
+            KillSinkInput,
+            KillSourceOutput,
+
+            LoadModule,
+            UnloadModule,
+
+            // Obsolete
+            AddAutoload___OBSOLETE,
+            RemoveAutoload___OBSOLETE,
+            GetAutoloadInfo___OBSOLETE,
+            GetAutoloadInfoList___OBSOLETE,
+
+            GetRecordLatency,
+            CorkRecordStream,
+            FlushRecordStream,
+            PrebufPlaybackStream,
+
+            // Server->Client
+            Request,
+            Overflow,
+            Underflow,
+            PlaybackStreamKilled,
+            RecordStreamKilled,
+            SubscribeEvent,
+
+            // More Client->Server
+            MoveSinkInput,
+            MoveSourceOutput,
+            SetSinkInputMute,
+
+            SuspendSink,
+            SuspendSource,
+
+            SetPlaybackStreamBufferAttr,
+            SetRecordStreamBufferAttr,
+
+            UpdatePlaybackStreamBufferAttr,
+            UpdateRecordStreamBufferAttr,
+
+            // Server->Client
+            PlaybackStreamSuspended,
+            RecordStreamSuspended,
+            PlaybackStreamMoved,
+            RecordStreamMoved,
+
+            UpdateRecordStreamProplist,
+            UpdatePlaybackStreamProplist,
+            UpdateClientProplist,
+            RemoveRecordStreamProplist,
+            RemovePlaybackStreamProplist,
+            RemoveClientProplist,
+
+            // Server->Client
+            Started,
+
+            Extension,
+
+            GetCardInfo,
+            GetCardInfoList,
+            SetCardProfile,
+
+            ClientEvent,
+            PlaybackStreamEvent,
+            RecordStreamEvent,
+
+            // Server->Client
+            PlaybackBufferAttrChanged,
+            RecordBufferAttrChanged,
+
+            SetSinkPort,
+            SetSourcePort,
+
+            SetSourceOutputVolume,
+            SetSourceOutputMute,
+            SetPortLatencyOffset,
+
+            // Both directions
+            EnableSRBChannel,
+            DisableSRBChannel,
+
+            RegisterMemfdShmid,
+            SendObjectMessage,
         };
     };
 };
