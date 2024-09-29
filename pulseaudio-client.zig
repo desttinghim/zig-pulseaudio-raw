@@ -8,6 +8,39 @@ pub fn main() !void {
 
     const allocator = gpa.allocator();
 
+    const sample_buffer = try allocator.alloc(i16, 300_000);
+    var sample_offset: usize = 0;
+    defer allocator.free(sample_buffer);
+
+    {
+        var i: usize = 0;
+        while (i < sample_buffer.len) : (i += 1) {
+            const amp = @cos(5000 * @as(f32, @floatFromInt(i)) / 44100.0);
+            sample_buffer[i] = @intFromFloat(amp * 32000.0);
+        }
+    }
+
+    {
+        // Graph first 80 samples
+        const stdout = std.io.getStdOut();
+        _ = try stdout.write("\n");
+        var a: i16 = 0;
+        while (a < 40) : (a += 1) {
+            var i: i16 = 0;
+            while (i < 80) : (i += 1) {
+                const point = sample_buffer[@intCast(i)];
+                const div = @divTrunc(std.math.maxInt(i16), 20);
+                const quant = @divTrunc(point, div);
+                const sym = if (quant == (a - 20)) "#" else " ";
+                _ = try stdout.write(sym);
+            }
+            _ = try stdout.write("\n");
+        }
+    }
+    // Wait for user input to keep going
+    const stdin = std.io.getStdIn();
+    try stdin.reader().skipUntilDelimiterOrEof('\n');
+
     var pa = PulseAudio{};
 
     try pa.connect(allocator);
@@ -40,7 +73,7 @@ pub fn main() !void {
 
     const params = PulseAudio.PlaybackStreamParams{
         .sample_spec = .{
-            .format = .Uint8,
+            .format = .Sint16Le,
             .channels = 2,
             .sample_rate = 44_100,
         },
@@ -59,96 +92,99 @@ pub fn main() !void {
         },
         .sync_id = 1,
         .cvolume = .{
-            .channels = 1,
+            .channels = 2,
             .volumes = [_]tagstruct.Volume{.Normal} ** 32,
         },
         .props = &[_]tagstruct.Prop{},
         .formats = &[_]tagstruct.FormatInfo{},
-        .flags = PulseAudio.Stream.Flags{},
+        .flags = PulseAudio.Stream.Flags{
+            .auto_timing_update = true,
+        },
     };
 
-    var buf_write = [_]u8{0} ** 1024;
-    var write_index: usize = 0;
-    const INVALID_INDEX = std.math.maxInt(u32);
-    const device = params.sink_name;
-    const corked = true;
-    const volume_set = false; // volume != null;
-    const version = PulseAudio.version;
-    const new_stream_seq = pa.get_next_seq();
     const is_playback = true;
     const is_recording = false;
     const is_not_upload = true;
+    const new_stream_seq = pa.get_next_seq();
+    const version = PulseAudio.version;
+    {
+        var buf_write = [_]u8{0} ** 1024;
+        var write_index: usize = 0;
+        const INVALID_INDEX = std.math.maxInt(u32);
+        const device = params.sink_name;
+        const corked = true;
+        const volume_set = false; // volume != null;
 
-    try PulseAudio.putHeader(&write_index, &buf_write, .{});
-    try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CreatePlaybackStream, new_stream_seq);
-    try tagstruct.putSampleSpec(&write_index, &buf_write, params.sample_spec);
-    try tagstruct.putChannelMap(&write_index, &buf_write, params.channel_map);
-    try tagstruct.putU32(&write_index, &buf_write, INVALID_INDEX);
-    try tagstruct.putString(&write_index, &buf_write, device);
-    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.max_length);
-    try tagstruct.putBoolean(&write_index, &buf_write, corked);
+        try PulseAudio.putHeader(&write_index, &buf_write, .{});
+        try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CreatePlaybackStream, new_stream_seq);
+        try tagstruct.putSampleSpec(&write_index, &buf_write, params.sample_spec);
+        try tagstruct.putChannelMap(&write_index, &buf_write, params.channel_map);
+        try tagstruct.putU32(&write_index, &buf_write, INVALID_INDEX);
+        try tagstruct.putString(&write_index, &buf_write, device);
+        try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.max_length);
+        try tagstruct.putBoolean(&write_index, &buf_write, corked);
 
-    // Playback specific
-    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.target_length);
-    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.pre_buffering);
-    try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.minimum_request_length);
-    try tagstruct.putU32(&write_index, &buf_write, params.sync_id);
+        // Playback specific
+        try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.target_length);
+        try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.pre_buffering);
+        try tagstruct.putU32(&write_index, &buf_write, params.buffer_attr.minimum_request_length);
+        try tagstruct.putU32(&write_index, &buf_write, params.sync_id);
 
-    try tagstruct.putCVolume(&write_index, &buf_write, params.cvolume);
+        try tagstruct.putCVolume(&write_index, &buf_write, params.cvolume);
 
-    if (version >= 12) {
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remap_channels); // no remap channels
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remix_channels); // no remix channels
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_format); // fix format
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_rate); // fix rate
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_channels); // fix channels
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_move); // dont move
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.variable_rate); // variable rate
+        if (version >= 12) {
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remap_channels); // no remap channels
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.no_remix_channels); // no remix channels
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_format); // fix format
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_rate); // fix rate
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fix_channels); // fix channels
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_move); // dont move
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.variable_rate); // variable rate
+        }
+
+        if (version >= 13) {
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted); // start muted
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.adjust_latency); // adjust latency
+            try tagstruct.putPropList(&write_index, &buf_write, params.props);
+        }
+
+        if (version >= 14) {
+            // if (direction == .Playback)
+            try tagstruct.putBoolean(&write_index, &buf_write, volume_set); // volume set
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.early_requests); // early stream requests
+        }
+
+        if (version >= 15) {
+            // if (direction == .Playback)
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted or params.flags.start_unmuted);
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_inhibit_auto_suspend);
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fail_on_suspend);
+        }
+        if (version >= 17) {
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
+        }
+        if (version >= 18) {
+            try tagstruct.putBoolean(&write_index, &buf_write, params.flags.stream_passthrough);
+        }
+        // if ((version >= 21 and stream.direction == .Playback) or version >= 22) {
+        const req_formats = [_]tagstruct.FormatInfo{};
+        try tagstruct.putU8(&write_index, &buf_write, req_formats.len);
+        for (req_formats) |format| {
+            try tagstruct.putFormatInfo(&write_index, &buf_write, format);
+        }
+        // }
+        // if (version >= 22 and stream.direction == .Record) {
+        //     try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
+        // }
+
+        // TODO: wow, that is a lot of fields to send
+        PulseAudio.write_finish(&buf_write, write_index);
+        std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
+
+        try pa.socket.?.writeAll(buf_write[0..write_index]);
     }
 
-    if (version >= 13) {
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted); // start muted
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.adjust_latency); // adjust latency
-        try tagstruct.putPropList(&write_index, &buf_write, params.props);
-    }
-
-    if (version >= 14) {
-        // if (direction == .Playback)
-        try tagstruct.putBoolean(&write_index, &buf_write, volume_set); // volume set
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.early_requests); // early stream requests
-    }
-
-    if (version >= 15) {
-        // if (direction == .Playback)
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.start_muted or params.flags.start_unmuted);
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.dont_inhibit_auto_suspend);
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.fail_on_suspend);
-    }
-    if (version >= 17) {
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
-    }
-    if (version >= 18) {
-        try tagstruct.putBoolean(&write_index, &buf_write, params.flags.stream_passthrough);
-    }
-    // if ((version >= 21 and stream.direction == .Playback) or version >= 22) {
-    const req_formats = [_]tagstruct.FormatInfo{};
-    try tagstruct.putU8(&write_index, &buf_write, req_formats.len);
-    for (req_formats) |format| {
-        try tagstruct.putFormatInfo(&write_index, &buf_write, format);
-    }
-    // }
-    // if (version >= 22 and stream.direction == .Record) {
-    //     try tagstruct.putBoolean(&write_index, &buf_write, params.flags.relative_volume);
-    // }
-
-    // TODO: wow, that is a lot of fields to send
-
-    PulseAudio.write_finish(&buf_write, write_index);
-
-    std.log.debug("{}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
-
-    try pa.socket.?.writeAll(buf_write[0..write_index]);
-
+    var channel: u32 = 0;
     // Read reply
     {
         const count = try pa.socket.?.read(&pa.buf_read);
@@ -167,8 +203,8 @@ pub fn main() !void {
         const seq_int = try tagstruct.getU32(&index, read_from);
         std.debug.assert(seq_int == new_stream_seq);
 
-        const channel_var = try tagstruct.getU32(&index, read_from);
-        if (channel_var == std.math.maxInt(u32)) return error.ProtocolError;
+        channel = try tagstruct.getU32(&index, read_from);
+        if (channel == std.math.maxInt(u32)) return error.ProtocolError;
 
         var stream_index: u32 = 0;
         var requested_bytes: u32 = 0;
@@ -201,7 +237,7 @@ pub fn main() !void {
             \\ requested bytes {}
             \\ buffer attr {}
             \\
-        , .{ command, seq_int, channel_var, stream_index, requested_bytes, buffer_attr });
+        , .{ command, seq_int, channel, stream_index, requested_bytes, buffer_attr });
 
         if (version >= 12 and is_not_upload) {
             const sample_spec = try tagstruct.getSampleSpec(&index, read_from);
@@ -244,19 +280,157 @@ pub fn main() !void {
         }
     }
 
+    // Wait again
+    try stdin.reader().skipUntilDelimiterOrEof('\n');
+
+    // const trigger_seq = pa.get_next_seq();
+    // // TODO: ask server to request from stream
+    // {
+    //     var buf_write = [_]u8{0} ** 1024;
+    //     var write_index: usize = 0;
+    //     try PulseAudio.putHeader(&write_index, &buf_write, .{});
+    //     try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.TriggerPlaybackStream, trigger_seq);
+    //     try tagstruct.putU32(&write_index, &buf_write, channel);
+
+    //     PulseAudio.write_finish(&buf_write, write_index);
+    //     std.log.debug("TriggerPlaybackStream: {}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
+
+    //     try pa.socket.?.writeAll(buf_write[0..write_index]);
+    // }
+
+    const cork_seq = pa.get_next_seq();
+    {
+        var buf_write = [_]u8{0} ** 1024;
+        var write_index: usize = 0;
+        try PulseAudio.putHeader(&write_index, &buf_write, .{});
+        try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.CorkPlaybackStream, cork_seq);
+        try tagstruct.putU32(&write_index, &buf_write, channel);
+        try tagstruct.putBoolean(&write_index, &buf_write, false);
+
+        PulseAudio.write_finish(&buf_write, write_index);
+        std.log.debug("CorkPlaybackStream: {}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
+
+        try pa.socket.?.writeAll(buf_write[0..write_index]);
+    }
+
+    var pollfds = [_]std.os.linux.pollfd{
+        .{ .fd = pa.socket.?.handle, .events = std.os.linux.POLL.IN, .revents = 0 },
+    };
+    var timeout = std.os.linux.timespec{
+        .tv_sec = 1,
+        .tv_nsec = 0,
+    };
+
     while (true) {
+        const poll_result = std.os.linux.ppoll(&pollfds, pollfds.len, &timeout, null);
+        if (poll_result < 0) { // Error occurred
+            const e = std.os.linux.E.init(poll_result);
+            switch (e) {
+                .SUCCESS => continue,
+                .PERM,
+                .NOENT,
+                => return error.Polling,
+            }
+        } else if (poll_result == 0) { // Timeout
+            // std.log.debug("Poll timeout {}", .{timeout});
+            timeout.tv_sec = 1;
+            continue;
+        }
+        // poll_result >= 1, we are ready to read
+
+        const event_in = std.os.linux.POLL.IN & pollfds[0].revents != 0;
+        const event_pri = std.os.linux.POLL.PRI & pollfds[0].revents != 0;
+        const event_out = std.os.linux.POLL.OUT & pollfds[0].revents != 0;
+        const event_err = std.os.linux.POLL.ERR & pollfds[0].revents != 0;
+        const event_hup = std.os.linux.POLL.HUP & pollfds[0].revents != 0;
+        const event_nval = std.os.linux.POLL.NVAL & pollfds[0].revents != 0;
+
+        std.log.debug("Poll returned, revent bits: 0b{b}\n" ++
+            "in: {}\n" ++
+            "pri: {}\n" ++
+            "out: {}\n" ++
+            "err: {}\n" ++
+            "hup: {}\n" ++
+            "nval: {}\n", .{
+            poll_result,
+            event_in,
+            event_pri,
+            event_out,
+            event_err,
+            event_hup,
+            event_nval,
+        });
+
+        if (event_hup) {
+            std.log.err("Hangup encountered! Something went wrong, shutting down...", .{});
+            break;
+        }
+
         const count = try pa.socket.?.read(&pa.buf_read);
 
         const read_from = pa.buf_read[0..count];
 
         var index: usize = 0;
         const header = try PulseAudio.read_pa_header(&index, read_from);
-        std.debug.assert(header.channel == std.math.maxInt(u32));
+        _ = header;
 
         const command = try PulseAudio.readCommand(&index, read_from);
         const seq_int = try tagstruct.getU32(&index, read_from);
 
         std.log.debug("New Stream reply: {} {} {}", .{ command, seq_int, std.fmt.fmtSliceHexUpper(read_from) });
+
+        if (command == .PlaybackBufferAttrChanged) {
+            const channel_changed = try tagstruct.getU32(&index, read_from);
+            const max_length = try tagstruct.getU32(&index, read_from);
+            const target_length = try tagstruct.getU32(&index, read_from);
+            const prebuf = try tagstruct.getU32(&index, read_from);
+            const minreq = try tagstruct.getU32(&index, read_from);
+            const usec = try tagstruct.getUsec(&index, read_from);
+            std.log.info("\nBufferAttr:\n" ++
+                "channel {}\n" ++
+                "max_length {}\n" ++
+                "target_length {}\n" ++
+                "prebuf {}\n" ++
+                "minreq {}\n" ++
+                "usec {}\n", .{ channel_changed, max_length, target_length, prebuf, minreq, usec });
+        } else if (command == .Request) {
+            const channel_req = try tagstruct.getU32(&index, read_from);
+            const requested_bytes = try tagstruct.getU32(&index, read_from);
+            const requested_shorts = requested_bytes / @sizeOf(i16);
+            std.debug.assert(channel == channel_req);
+
+            if (sample_offset + requested_shorts > sample_buffer.len) {
+                sample_offset = 0;
+            }
+            const length = @min(requested_shorts, sample_buffer.len);
+
+            std.log.debug("requested_bytes: {}", .{requested_shorts});
+
+            var buf_write = [_]u8{0} ** 4096;
+            var write_index: usize = 0;
+            try PulseAudio.putHeader(&write_index, &buf_write, .{ .channel = channel });
+            var avg: f32 = 0;
+            var max: i16 = std.math.minInt(i16);
+            var min: i16 = std.math.maxInt(i16);
+            for (sample_buffer[sample_offset..][0..length]) |sample| {
+                min = @min(min, sample);
+                max = @max(max, sample);
+                avg += @floatFromInt(sample);
+            }
+            avg /= @floatFromInt(length);
+            std.log.debug("Max: {}, Min: {}, Average: {}", .{ max, min, avg });
+            const sample_bytes = std.mem.sliceAsBytes(sample_buffer[sample_offset..][0..length]);
+            @memcpy(buf_write[write_index..][0..sample_bytes.len], sample_bytes[0..]);
+            write_index += sample_bytes.len;
+
+            sample_offset += length;
+
+            PulseAudio.write_finish(&buf_write, write_index);
+
+            try pa.socket.?.writeAll(buf_write[0..write_index]);
+
+            // break;
+        }
     }
 }
 
