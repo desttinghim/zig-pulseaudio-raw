@@ -67,10 +67,6 @@ pub fn main() !void {
 
     std.log.info("Client Index: {}", .{pa.client_index});
 
-    // pa.stream_new(.{
-    //     .name = "pa-zig",
-    // });
-
     const params = PulseAudio.PlaybackStreamParams{
         .sample_spec = .{
             .format = .Sint16Le,
@@ -283,21 +279,6 @@ pub fn main() !void {
     // Wait again
     try stdin.reader().skipUntilDelimiterOrEof('\n');
 
-    // const trigger_seq = pa.get_next_seq();
-    // // TODO: ask server to request from stream
-    // {
-    //     var buf_write = [_]u8{0} ** 1024;
-    //     var write_index: usize = 0;
-    //     try PulseAudio.putHeader(&write_index, &buf_write, .{});
-    //     try PulseAudio.putCommand(&write_index, &buf_write, PulseAudio.Command.Tag.TriggerPlaybackStream, trigger_seq);
-    //     try tagstruct.putU32(&write_index, &buf_write, channel);
-
-    //     PulseAudio.write_finish(&buf_write, write_index);
-    //     std.log.debug("TriggerPlaybackStream: {}", .{std.fmt.fmtSliceHexUpper(buf_write[0..write_index])});
-
-    //     try pa.socket.?.writeAll(buf_write[0..write_index]);
-    // }
-
     const cork_seq = pa.get_next_seq();
     {
         var buf_write = [_]u8{0} ** 1024;
@@ -366,14 +347,11 @@ pub fn main() !void {
             break;
         }
 
-        const count = try pa.socket.?.read(&pa.buf_read);
-
-        const read_from = pa.buf_read[0..count];
+        const header = try pa.read_pa_header_blocking();
+        std.debug.assert(try pa.socket.?.readAll(pa.buf_read[20..][0..header.length]) == header.length);
+        const read_from = pa.buf_read[20..][0..header.length];
 
         var index: usize = 0;
-        const header = try PulseAudio.read_pa_header(&index, read_from);
-        _ = header;
-
         const command = try PulseAudio.readCommand(&index, read_from);
         const seq_int = try tagstruct.getU32(&index, read_from);
 
@@ -697,6 +675,13 @@ const PulseAudio = struct {
         seq: u32,
         command: Command,
     };
+
+    pub fn read_pa_header_blocking(pa: *PulseAudio) !Header {
+        const socket = pa.socket orelse return error.NoConnection;
+        if (try socket.readAll(pa.buf_read[0..20]) != 20) return error.EndOfStream;
+        var index: usize = 0;
+        return try read_pa_header(&index, pa.buf_read[0..20]);
+    }
 
     pub fn read_pa_header(index: *usize, buffer: []const u8) !Header {
         if (index.* > buffer.len -| 20) return error.EndOfStream;
