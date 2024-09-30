@@ -8,39 +8,6 @@ pub fn main() !void {
 
     const allocator = gpa.allocator();
 
-    const sample_buffer = try allocator.alloc(i16, 300_000);
-    var sample_offset: usize = 0;
-    defer allocator.free(sample_buffer);
-
-    {
-        var i: usize = 0;
-        while (i < sample_buffer.len) : (i += 1) {
-            const amp = @cos(5000 * @as(f32, @floatFromInt(i)) / 44100.0);
-            sample_buffer[i] = @intFromFloat(amp * 32000.0);
-        }
-    }
-
-    {
-        // Graph first 80 samples
-        const stdout = std.io.getStdOut();
-        _ = try stdout.write("\n");
-        var a: i16 = 0;
-        while (a < 40) : (a += 1) {
-            var i: i16 = 0;
-            while (i < 80) : (i += 1) {
-                const point = sample_buffer[@intCast(i)];
-                const div = @divTrunc(std.math.maxInt(i16), 20);
-                const quant = @divTrunc(point, div);
-                const sym = if (quant == (a - 20)) "#" else " ";
-                _ = try stdout.write(sym);
-            }
-            _ = try stdout.write("\n");
-        }
-    }
-    // Wait for user input to keep going
-    const stdin = std.io.getStdIn();
-    try stdin.reader().skipUntilDelimiterOrEof('\n');
-
     var pa = PulseAudio{};
 
     try pa.connect(allocator);
@@ -276,9 +243,6 @@ pub fn main() !void {
         }
     }
 
-    // Wait again
-    try stdin.reader().skipUntilDelimiterOrEof('\n');
-
     const cork_seq = pa.get_next_seq();
     {
         var buf_write = [_]u8{0} ** 1024;
@@ -301,6 +265,8 @@ pub fn main() !void {
         .tv_sec = 1,
         .tv_nsec = 0,
     };
+
+    var sample_offset: usize = 0;
 
     while (true) {
         const poll_result = std.os.linux.ppoll(&pollfds, pollfds.len, &timeout, null);
@@ -325,22 +291,27 @@ pub fn main() !void {
         const event_err = std.os.linux.POLL.ERR & pollfds[0].revents != 0;
         const event_hup = std.os.linux.POLL.HUP & pollfds[0].revents != 0;
         const event_nval = std.os.linux.POLL.NVAL & pollfds[0].revents != 0;
+        _ = event_in;
+        _ = event_pri;
+        _ = event_out;
+        _ = event_err;
+        _ = event_nval;
 
-        std.log.debug("Poll returned, revent bits: 0b{b}\n" ++
-            "in: {}\n" ++
-            "pri: {}\n" ++
-            "out: {}\n" ++
-            "err: {}\n" ++
-            "hup: {}\n" ++
-            "nval: {}\n", .{
-            poll_result,
-            event_in,
-            event_pri,
-            event_out,
-            event_err,
-            event_hup,
-            event_nval,
-        });
+        // std.log.debug("Poll returned, revent bits: 0b{b}\n" ++
+        //     "in: {}\n" ++
+        //     "pri: {}\n" ++
+        //     "out: {}\n" ++
+        //     "err: {}\n" ++
+        //     "hup: {}\n" ++
+        //     "nval: {}\n", .{
+        //     poll_result,
+        //     event_in,
+        //     event_pri,
+        //     event_out,
+        //     event_err,
+        //     event_hup,
+        //     event_nval,
+        // });
 
         if (event_hup) {
             std.log.err("Hangup encountered! Something went wrong, shutting down...", .{});
@@ -354,8 +325,9 @@ pub fn main() !void {
         var index: usize = 0;
         const command = try PulseAudio.readCommand(&index, read_from);
         const seq_int = try tagstruct.getU32(&index, read_from);
+        _ = seq_int;
 
-        std.log.debug("New Stream reply: {} {} {}", .{ command, seq_int, std.fmt.fmtSliceHexUpper(read_from) });
+        // std.log.debug("New Stream reply: {} {} {}", .{ command, seq_int, std.fmt.fmtSliceHexUpper(read_from) });
 
         if (command == .PlaybackBufferAttrChanged) {
             const channel_changed = try tagstruct.getU32(&index, read_from);
@@ -374,45 +346,30 @@ pub fn main() !void {
         } else if (command == .Request) {
             const channel_req = try tagstruct.getU32(&index, read_from);
             const requested_bytes = try tagstruct.getU32(&index, read_from);
-            const requested_shorts = requested_bytes / @sizeOf(i16);
             std.debug.assert(channel == channel_req);
-
-            if (sample_offset + requested_shorts > sample_buffer.len) {
-                sample_offset = 0;
-            }
-            const length = @min(requested_shorts, sample_buffer.len);
-
-            std.log.debug("requested_bytes: {}", .{requested_shorts});
 
             var buf_write = [_]u8{0} ** 4096;
             var write_index: usize = 0;
-            try PulseAudio.putHeader(&write_index, &buf_write, .{ .channel = channel });
-            var avg: f32 = 0;
-            var max: i16 = std.math.minInt(i16);
-            var min: i16 = std.math.maxInt(i16);
-            for (sample_buffer[sample_offset..][0..length]) |sample| {
-                min = @min(min, sample);
-                max = @max(max, sample);
-                avg += @floatFromInt(sample);
-            }
-            avg /= @floatFromInt(length);
-            std.log.debug("Max: {}, Min: {}, Average: {}", .{ max, min, avg });
-            const sample_bytes = std.mem.sliceAsBytes(sample_buffer[sample_offset..][0..length]);
-            @memcpy(buf_write[write_index..][0..sample_bytes.len], sample_bytes[0..]);
-            write_index += sample_bytes.len;
 
-            sample_offset += length;
+            try PulseAudio.putHeader(&write_index, &buf_write, .{ .channel = channel });
+
+            const samples = std.mem.bytesAsSlice(i16, buf_write[write_index..][0..requested_bytes]);
+
+            if (samples.len == 0) return error.EmptySlice;
+            for (samples, 0..) |*sample, i| {
+                const amp = @cos(5000 * @as(f32, @floatFromInt(sample_offset + i)) / 44100.0);
+                sample.* = @intFromFloat(amp * 32000.0);
+            }
+
+            write_index += requested_bytes;
+            sample_offset += samples.len;
 
             PulseAudio.write_finish(&buf_write, write_index);
 
             try pa.socket.?.writeAll(buf_write[0..write_index]);
-
-            // break;
         }
     }
 }
-
-// fn stream_request_cb(stream: *anyopaque) callconv(.C) void {}
 
 const PulseAudio = struct {
     seq: u32 = 0,
